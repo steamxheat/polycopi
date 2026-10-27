@@ -76,6 +76,11 @@ DEFAULTS = {
     "data_url": "https://data-api.polymarket.com",
     "gamma_url": "https://gamma-api.polymarket.com",
     "binance_ws": "wss://data-stream.binance.vision/stream",
+    "clob_ws": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+    "use_clob_ws": True,            # сделки в реальном времени (data-api отстаёт на десятки секунд)
+    "order_latency_s": 0.3,         # заявка начинает работать через N с после решения
+    "cancel_latency_s": 0.3,        # снятие срабатывает через N с
+    "ws_silence_s": 10,
     "binance_rest": "https://data-api.binance.vision",
 }
 
@@ -336,7 +341,10 @@ class Engine:
         self.trade_seen: dict[str, set] = {}
         self.resolve_next: dict[str, float] = {}
         self.prices = PriceFeed(list(cfg["assets"].values()))
-        self.trade_lag: deque = deque(maxlen=2000)   # через сколько секунд сделка видна в API
+        self.trade_lag: dict[str, deque] = {"ws": deque(maxlen=2000), "api": deque(maxlen=2000)}
+        self.run_started = api.now()
+        self.ws_intervals: list = []      # [начало, конец] периодов, когда лента CLOB работала
+        self.ws_last_msg = 0.0
         self.done_pairs: list[dict] = []      # итоги рассчитанных пар (для отчёта)
         self._load()
 
@@ -584,7 +592,11 @@ class Engine:
         self.event(ev="move", asset=asset, bps=round(bps, 2), canceled_pairs=n)
 
     # ------------------------------------------------------------ fills
-    def on_trade(self, mk: Market, tr: dict):
+    def ws_covered(self, ts: float) -> bool:
+        """Секунда ts целиком попала в период работы ленты CLOB -> сделка уже учтена из неё."""
+        return any(a <= ts and ts + 1 <= b for a, b in self.ws_intervals)
+
+    def on_trade(self, mk: Market, tr: dict, source: str = "api"):
         try:
             token, price, size = str(tr["asset"]), float(tr["price"]), float(tr["size"])
             ts = float(tr["timestamp"])
@@ -592,18 +604,27 @@ class Engine:
             return
         if ts > 1e12:
             ts /= 1000
-        key = f"{tr.get('transactionHash')}:{token}:{size}:{price}:{ts}:{tr.get('proxyWallet')}"
+        if source == "api" and self.ws_covered(ts):
+            return                                   # эту секунду уже видели в ленте CLOB
+        key = f"{source}:{tr.get('transactionHash')}:{token}:{size}:{price}:{ts}:{tr.get('proxyWallet')}"
         seen = self.trade_seen.setdefault(mk.slug, set())
         if key in seen:
             return
         seen.add(key)
         mk.trades_seen += 1
-        self.trade_lag.append(self.api.now() - ts)
+        self.count(f"trades_{source}")
+        if ts >= self.run_started:
+            self.trade_lag[source].append(self.api.now() - ts)
         avail = size
+        lat_o, lat_c = self.cfg["order_latency_s"], self.cfg["cancel_latency_s"]
+        if source == "ws":       # точное время (мс)
+            alive = lambda o: (ts > o.placed_ts + lat_o and
+                               (o.canceled_ts is None or ts <= o.canceled_ts + lat_c))
+        else:                    # время до секунды: пессимистично в обе стороны
+            alive = lambda o: (ts >= math.floor(o.placed_ts) + 1 and
+                               (o.canceled_ts is None or ts <= o.canceled_ts))
         cands = [o for o in self.orders.values()
-                 if o.slug == mk.slug and o.token == token and o.remaining > 1e-9
-                 and ts >= math.floor(o.placed_ts) + 1
-                 and (o.canceled_ts is None or ts <= o.canceled_ts)]
+                 if o.slug == mk.slug and o.token == token and o.remaining > 1e-9 and alive(o)]
         cands.sort(key=lambda o: (-o.price, o.placed_ts))
         for o in cands:
             if avail <= 1e-9:
@@ -791,9 +812,14 @@ class Engine:
                   f"-{out.get('one_leg_loss', 0)}, рынков {c.get('markets_resolved', 0)} "
                   f"| рывков {c.get('moves', 0)} | Binance "
                   f"{self.prices.source} {'' if not self.prices.last_update else f'{self.api.now() - self.prices.last_update:.0f}с назад'}"
-                  f" (обрывов {c.get('binance_ws_reconnect', 0)}) | сделки видны через "
-                  f"{statistics.median(self.trade_lag) if self.trade_lag else 0:.1f}с (медиана), "
-                  f"поздних исполнений {c.get('late_fills', 0)}")
+                  f" (обрывов {c.get('binance_ws_reconnect', 0)}) | сделки: лента CLOB "
+                  f"{c.get('trades_ws', 0)} (задержка {self._lag('ws')}, обрывов "
+                  f"{c.get('clob_ws_reconnect', 0)}), data-api {c.get('trades_api', 0)} "
+                  f"(задержка {self._lag('api')}) | поздних исполнений {c.get('late_fills', 0)}")
+
+    def _lag(self, src: str) -> str:
+        xs = self.trade_lag[src]
+        return f"{statistics.median(xs):.1f}с" if xs else "-"
 
 
 # ======================================================================= feeds
@@ -809,7 +835,7 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
             eng.info("Binance: поток подключён")
             backoff = 1
             while not stop.is_set():
-                msg = json.loads(await asyncio.wait_for(ws.recv(), 30))
+                msg = json.loads(await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"]))
                 d = msg.get("data", msg)
                 if d.get("e") == "aggTrade":
                     # время приёма по своим часам: при расхождении часов сервера и биржи
@@ -831,6 +857,83 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
         except asyncio.TimeoutError:
             pass
         backoff = min(backoff * 2, 60)
+
+
+def _live_tokens(eng: Engine) -> dict:
+    out = {}
+    for mk in eng.markets.values():
+        if not mk.resolved and eng.api.now() <= mk.end_ts + 10:
+            out[mk.up_token] = mk
+            out[mk.down_token] = mk
+    return out
+
+
+async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
+    """Лента CLOB: сделки (last_trade_price) в реальном времени по токенам текущих рынков."""
+    backoff = 1
+    while not stop.is_set():
+        tokens = _live_tokens(eng)
+        if not tokens:
+            try:
+                await asyncio.wait_for(stop.wait(), 1)
+            except asyncio.TimeoutError:
+                pass
+            continue
+        ws, interval, pinger = None, None, None
+        try:
+            ws = await WebSocket.connect(eng.cfg["clob_ws"])
+            await ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
+            interval = [eng.api.now(), eng.api.now()]
+            eng.ws_intervals.append(interval)
+            eng.ws_intervals[:] = eng.ws_intervals[-200:]
+            log.debug(f"CLOB WS: подписка на {len(tokens)} токенов")
+            backoff = 1
+
+            async def ping():
+                while True:
+                    await asyncio.sleep(10)
+                    await ws.send("PING")
+            pinger = asyncio.ensure_future(ping())
+            while not stop.is_set():
+                if set(_live_tokens(eng)) != set(tokens):
+                    break                                   # новый рынок -> переподписка
+                raw = await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"])
+                now = eng.api.now()
+                interval[1] = now
+                eng.ws_last_msg = now
+                if raw.strip().upper() == "PONG":
+                    continue
+                try:
+                    data = json.loads(raw)
+                except ValueError:
+                    continue
+                for ev in (data if isinstance(data, list) else [data]):
+                    if not isinstance(ev, dict) or ev.get("event_type") != "last_trade_price":
+                        continue
+                    mk = tokens.get(str(ev.get("asset_id")))
+                    if mk is None:
+                        continue
+                    eng.on_trade(mk, {"asset": ev.get("asset_id"), "price": ev.get("price"),
+                                      "size": ev.get("size"), "timestamp": ev.get("timestamp"),
+                                      "transactionHash": ev.get("transaction_hash", ""),
+                                      "proxyWallet": ev.get("side", "")}, "ws")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            eng.count("clob_ws_reconnect")
+            n = eng.counters["clob_ws_reconnect"]
+            msg = f"CLOB WS: обрыв #{n}: {type(e).__name__}: {e}"
+            (eng.info if n in (1, 2, 3, 10) or n % 50 == 0 else log.debug)(msg)
+        finally:
+            if pinger:
+                pinger.cancel()
+            if ws:
+                await ws.close()
+        try:
+            await asyncio.wait_for(stop.wait(), backoff if eng.counters.get("clob_ws_reconnect") else 0)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, 30)
 
 
 async def binance_rest_loop(eng: Engine, stop: asyncio.Event):
@@ -897,8 +1000,11 @@ async def run(cfg: dict, out: Path):
     eng.info(f"Старт маркет-мейкер-симулятора: {', '.join(a.upper() for a in cfg['assets'])}, "
              f"{cfg['shares']} акций на ногу, пара = 1 − {cfg['edge']}, счёт ${eng.acct.cash:.2f}")
     log.debug("Настройки: " + json.dumps(cfg, ensure_ascii=False))
-    tasks = [asyncio.ensure_future(x) for x in (main_loop(eng, stop), move_watch(eng, stop),
-                                                 binance_ws_loop(eng, stop), binance_rest_loop(eng, stop))]
+    loops = [main_loop(eng, stop), move_watch(eng, stop), binance_ws_loop(eng, stop),
+             binance_rest_loop(eng, stop)]
+    if cfg["use_clob_ws"]:
+        loops.append(clob_ws_loop(eng, stop))
+    tasks = [asyncio.ensure_future(x) for x in loops]
     await stop.wait()
     for t in tasks:
         t.cancel()
@@ -1015,9 +1121,71 @@ async def check(cfg: dict) -> bool:
     return ok
 
 
+async def diag(cfg: dict, seconds: int = 60):
+    """Минутная диагностика сети: идут ли потоки без «замираний»."""
+    api = Api(cfg)
+    now = time.time()
+    start = int(now // 300 * 300)
+    toks = []
+    for asset in cfg["assets"]:
+        m = await api.get_market(f"{asset}-updown-5m-{start}")
+        if m:
+            toks += [str(t) for t in _as_list(m.get("clobTokenIds"))]
+    syms = list(cfg["assets"].values())
+    burl = cfg["binance_ws"] + "?streams=" + "/".join(f"{x.lower()}@aggTrade" for x in syms)
+    buckets = {"binance_ws": [0] * (seconds // 10), "clob_ws": [0] * (seconds // 10),
+               "clob_trades": [0] * (seconds // 10)}
+    t0 = time.time()
+    errors = []
+
+    async def reader(name, url, sub):
+        try:
+            ws = await WebSocket.connect(url)
+            if sub:
+                await ws.send(sub)
+            while time.time() - t0 < seconds:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), seconds - (time.time() - t0))
+                except asyncio.TimeoutError:
+                    break
+                i = min(int((time.time() - t0) // 10), len(buckets[name]) - 1)
+                buckets[name][i] += 1
+                if name == "clob_ws" and "last_trade_price" in raw:
+                    buckets["clob_trades"][i] += raw.count("last_trade_price")
+            await ws.close()
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{name}: {type(e).__name__}: {e} на {time.time() - t0:.0f}с")
+
+    async def rest():
+        out = []
+        while time.time() - t0 < seconds:
+            a = time.perf_counter()
+            try:
+                await api.get_prices(syms)
+                out.append(f"{(time.perf_counter() - a) * 1000:.0f}")
+            except Exception as e:  # noqa: BLE001
+                out.append(f"ERR({type(e).__name__})")
+            await asyncio.sleep(5)
+        return out
+
+    print(f"Диагностика {seconds} с (сообщений за каждые 10 с)...")
+    res = await asyncio.gather(
+        reader("binance_ws", burl, None),
+        reader("clob_ws", cfg["clob_ws"], json.dumps({"assets_ids": toks, "type": "market"}) if toks else None),
+        rest())
+    for k, v in buckets.items():
+        print(f"  {k:<12} {v}")
+    print(f"  binance REST, мс: {res[2]}")
+    for e in errors:
+        print(f"  ОШИБКА {e}")
+    frozen = [k for k, v in buckets.items() if k != "clob_trades" and v and v[0] > 0 and 0 in v[1:]]
+    print("Итог:", "потоки замирают: " + ", ".join(frozen) + " — похоже на блокировку/фильтрацию сети "
+          "на стороне сервера" if frozen else "потоки идут без замираний")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Симулятор маркет-мейкера Polymarket 5m BTC/ETH")
-    ap.add_argument("cmd", choices=["run", "report", "check"])
+    ap.add_argument("cmd", choices=["run", "report", "check", "diag"])
     ap.add_argument("--config", default=str(HERE / "mm_config.json"))
     ap.add_argument("--out", default=str(HERE / "data_mm"))
     a = ap.parse_args()
@@ -1026,6 +1194,8 @@ def main():
         asyncio.run(run(cfg, Path(a.out)))
     elif a.cmd == "report":
         print(report(Path(a.out)))
+    elif a.cmd == "diag":
+        asyncio.run(diag(cfg))
     else:
         sys.exit(0 if asyncio.run(check(cfg)) else 1)
 

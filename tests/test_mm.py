@@ -354,5 +354,75 @@ class MMNetTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(tmp)
 
 
+
+class ClobWsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_clob_ws_fills_precisely_and_dedupes_api(self):
+        got_sub = {}
+        q = asyncio.Queue()
+
+        async def handler(reader, writer):
+            op, _, data = await fp.ws_read(reader)
+            got_sub["msg"] = json.loads(data)
+            while True:
+                m = await q.get()
+                writer.write(fp.ws_frame(0x1, json.dumps(m).encode()))
+                await writer.drain()
+
+        srv, url = await fp.start_ws(handler)
+        tmp = Path(tempfile.mkdtemp())
+        api = FakeApi()
+        api.t = time.time()
+        start = int(api.t // 300 * 300)
+        slug = f"btc-updown-5m-{start}"
+        api.markets[slug] = gamma_market(slug=slug)
+        api.now = time.time
+        try:
+            c = cfg(clob_ws=url, start_after_s=0, stop_new_pairs_before_end_s=0,
+                    cancel_all_before_end_s=0, order_latency_s=0.3)
+            e = Engine(c, api, tmp, quiet=True)
+            await e.step()
+            mk = e.markets[slug]
+            p = e.pairs[mk.pairs[0]]
+            ou = e.orders[p.up]
+            stop = asyncio.Event()
+            task = asyncio.ensure_future(mmsim.clob_ws_loop(e, stop))
+            for _ in range(50):
+                if got_sub:
+                    break
+                await asyncio.sleep(0.05)
+            self.assertEqual(set(got_sub["msg"]["assets_ids"]), {UP, DN})
+            self.assertEqual(got_sub["msg"]["type"], "market")
+            # сделка через 0.1 с после выставления — ещё до того, как заявка «дошла» -> не наша
+            ms = lambda t: str(int(t * 1000))
+            await q.put([{"event_type": "last_trade_price", "asset_id": UP, "price": "0.40",
+                          "size": "50", "timestamp": ms(ou.placed_ts + 0.1)}])
+            await q.put({"event_type": "last_trade_price", "asset_id": UP, "price": "0.40",
+                         "size": "50", "timestamp": ms(ou.placed_ts + 0.5)})
+            await q.put({"event_type": "price_change", "asset_id": UP})
+            for _ in range(50):
+                if ou.filled:
+                    break
+                await asyncio.sleep(0.05)
+            self.assertEqual(ou.filled, 5)
+            self.assertEqual(e.counters["trades_ws"], 2)
+            # та же сделка из data-api (секундное время) не учитывается второй раз
+            await asyncio.sleep(2.1)
+            await q.put({"event_type": "price_change", "asset_id": UP})     # лента жива
+            await asyncio.sleep(0.2)
+            a, b = e.ws_intervals[-1]
+            sec = int(a) + 1                                  # секунда целиком внутри периода
+            self.assertTrue(e.ws_covered(sec))
+            self.assertFalse(e.ws_covered(int(a) - 5))         # до подключения — не покрыто
+            api.trades[COND] = [tr(UP, 0.40, 50, sec, "0xdup")]
+            await e.poll_trades(mk)
+            self.assertEqual(e.counters.get("trades_api", 0), 0)
+            stop.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        finally:
+            srv.close()
+            shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
