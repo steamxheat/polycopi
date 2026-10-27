@@ -6,7 +6,7 @@ import json,sys,time
 for p in json.load(sys.stdin):
     if p["name"] in ("polycopy-sim","polymm-sim"):
         e=p["pm2_env"]; up=(time.time()*1000-e.get("pm_uptime",0))/60000
-        print(f"== {p[\"name\"]}: {e[\"status\"]}, работает {up:.0f} мин, перезапусков {e.get(\"restart_time\",0)}")'
+        print("== %s: %s, работает %.0f мин, перезапусков %s" % (p["name"], e["status"], up, e.get("restart_time",0)))'
 echo; echo "===== КОПИ-БОТ ====="
 python3 simbot.py report 2>&1 | sed -n '1,14p'
 echo; echo "===== МАРКЕТ-МЕЙКЕР ====="
