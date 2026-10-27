@@ -336,6 +336,7 @@ class Engine:
         self.trade_seen: dict[str, set] = {}
         self.resolve_next: dict[str, float] = {}
         self.prices = PriceFeed(list(cfg["assets"].values()))
+        self.trade_lag: deque = deque(maxlen=2000)   # через сколько секунд сделка видна в API
         self.done_pairs: list[dict] = []      # итоги рассчитанных пар (для отчёта)
         self._load()
 
@@ -473,7 +474,7 @@ class Engine:
             return
         tick = mk.tick
         qu = floor_tick(fair - cfg["edge"] / 2, tick)
-        qd = floor_tick(1 - fair - cfg["edge"] / 2, tick)
+        qd = round(1 - cfg["edge"] - qu, 4)          # сумма пары ровно 1 - edge
         # остаёмся мейкером: строго ниже лучшего предложения
         if ba is not None:
             qu = min(qu, floor_tick(ba - tick, tick))
@@ -597,6 +598,7 @@ class Engine:
             return
         seen.add(key)
         mk.trades_seen += 1
+        self.trade_lag.append(self.api.now() - ts)
         avail = size
         cands = [o for o in self.orders.values()
                  if o.slug == mk.slug and o.token == token and o.remaining > 1e-9
@@ -788,7 +790,10 @@ class Engine:
                   f"{c.get('pairs_complete', 0)} | итоги: одна нога +{out.get('one_leg_win', 0)}/"
                   f"-{out.get('one_leg_loss', 0)}, рынков {c.get('markets_resolved', 0)} "
                   f"| рывков {c.get('moves', 0)} | Binance "
-                  f"{self.prices.source} {'' if not self.prices.last_update else f'{self.api.now() - self.prices.last_update:.0f}с назад'}")
+                  f"{self.prices.source} {'' if not self.prices.last_update else f'{self.api.now() - self.prices.last_update:.0f}с назад'}"
+                  f" (обрывов {c.get('binance_ws_reconnect', 0)}) | сделки видны через "
+                  f"{statistics.median(self.trade_lag) if self.trade_lag else 0:.1f}с (медиана), "
+                  f"поздних исполнений {c.get('late_fills', 0)}")
 
 
 # ======================================================================= feeds
@@ -807,13 +812,17 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
                 msg = json.loads(await asyncio.wait_for(ws.recv(), 30))
                 d = msg.get("data", msg)
                 if d.get("e") == "aggTrade":
-                    eng.prices.add(d["s"], d["T"] / 1000, float(d["p"]))
+                    # время приёма по своим часам: при расхождении часов сервера и биржи
+                    # окно «рывка» иначе оказывается пустым и рывки не ловятся
+                    eng.prices.add(d["s"], eng.api.now(), float(d["p"]))
                     eng.prices.source = "ws"
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             eng.count("binance_ws_reconnect")
-            log.debug(f"Binance WS: {e}")
+            n = eng.counters["binance_ws_reconnect"]
+            msg = f"Binance WS: обрыв #{n}: {type(e).__name__}: {e}"
+            (eng.info if n in (1, 2, 3, 10) or n % 50 == 0 else log.debug)(msg)
         finally:
             if ws:
                 await ws.close()
