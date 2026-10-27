@@ -27,8 +27,9 @@ class HttpError(Exception):
 class Http:
     """Синхронный пул соединений; вызывается из asyncio через to_thread."""
 
-    def __init__(self, timeout: float = 5.0):
+    def __init__(self, timeout: float = 5.0, keepalive: bool = True):
         self.timeout = timeout
+        self.keepalive = keepalive      # False: новое соединение на каждый запрос
         self._idle: dict[str, list] = {}
         self._lock = threading.Lock()
         self._ctx = ssl.create_default_context()
@@ -62,7 +63,10 @@ class Http:
                 if r.status != 200:
                     conn.close()
                     raise HttpError(f"{r.status} {url} {body[:200]!r}")
-                self._put_conn(key, conn)
+                if self.keepalive:
+                    self._put_conn(key, conn)
+                else:
+                    conn.close()
                 return json.loads(body)
             except HttpError:
                 raise

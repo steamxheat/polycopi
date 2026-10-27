@@ -424,5 +424,67 @@ class ClobWsTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(tmp)
 
 
+
+class RtdsPriceTests(unittest.IsolatedAsyncioTestCase):
+    def test_parse(self):
+        self.assertEqual(mmsim.parse_rtds_price({"topic": "crypto_prices", "type": "update",
+                                                 "payload": {"symbol": "btcusdt", "timestamp": 1,
+                                                             "value": 79761.13}}),
+                         [("BTCUSDT", 79761.13, 1)])
+        snap = mmsim.parse_rtds_price({"topic": "crypto_prices", "type": "subscribe",
+                                       "payload": {"symbol": "ethusdt",
+                                                   "data": [{"timestamp": 1, "value": 2300},
+                                                            {"timestamp": 2, "value": "2301.5"}]}})
+        self.assertEqual(snap[-1], ("ETHUSDT", 2301.5, 2))
+        self.assertEqual(mmsim.parse_rtds_price({"topic": "activity", "payload": {}}), [])
+        self.assertEqual(mmsim.parse_rtds_price({"topic": "crypto_prices",
+                                                 "payload": {"symbol": "dogeusdt", "value": 1}}), [])
+
+    async def test_rtds_loop_feeds_prices(self):
+        got = {}
+
+        async def handler(reader, writer):
+            op, _, data = await fp.ws_read(reader)
+            got["sub"] = json.loads(data)
+            for v in (100000, 100150):
+                writer.write(fp.ws_frame(0x1, json.dumps(
+                    {"topic": "crypto_prices", "type": "update",
+                     "payload": {"symbol": "btcusdt", "timestamp": 1, "value": v}}).encode()))
+            await writer.drain()
+            while True:
+                await fp.ws_read(reader)
+
+        srv, url = await fp.start_ws(handler)
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            c = cfg(rtds_url=url)
+            e = Engine(c, mmsim.Api(c), tmp, quiet=True)
+            stop = asyncio.Event()
+            task = asyncio.ensure_future(mmsim.rtds_price_loop(e, stop))
+            await asyncio.sleep(0.4)
+            stop.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(got["sub"]["subscriptions"],
+                             [{"topic": "crypto_prices", "type": "update", "filters": "btcusdt"}])
+            self.assertEqual(e.prices.last("BTCUSDT"), 100150)
+            self.assertEqual(e.prices.source, "rtds")
+            self.assertGreater(e.prices.move_bps("BTCUSDT", time.time(), 3), 14)
+        finally:
+            srv.close()
+            shutil.rmtree(tmp)
+
+    def test_http_no_keepalive(self):
+        st = fp.FakeState()
+        st.books["9"] = {"bids": [], "asks": []}
+        srv, base = fp.start_http(st)
+        from net import Http
+        h = Http(keepalive=False)
+        for _ in range(3):
+            h.get_json(base + "/book", {"token_id": "9"})
+        self.assertEqual(st.connections, 3)          # каждый раз новое соединение
+        srv.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

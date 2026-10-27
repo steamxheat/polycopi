@@ -81,6 +81,10 @@ DEFAULTS = {
     "order_latency_s": 0.3,         # заявка начинает работать через N с после решения
     "cancel_latency_s": 0.3,        # снятие срабатывает через N с
     "ws_silence_s": 10,
+    "use_rtds_prices": True,        # цены Binance через сервер Polymarket (RTDS)
+    "use_binance_ws": True,         # прямой поток Binance (может резаться сетью сервера)
+    "rtds_url": "wss://ws-live-data.polymarket.com",
+    "rest_fallback_after_s": 2,     # опрос REST, если потоки молчат дольше N с
     "binance_rest": "https://data-api.binance.vision",
 }
 
@@ -272,6 +276,8 @@ class Api:
     def __init__(self, cfg):
         self.cfg = cfg
         self.http = Http(timeout=5.0)
+        # Binance REST без keep-alive: на некоторых сетях длинное соединение «замерзает»
+        self.http_px = Http(timeout=3.0, keepalive=False)
 
     def now(self):
         return time.time()
@@ -294,7 +300,7 @@ class Api:
         return res if isinstance(res, list) else []
 
     async def get_prices(self, symbols: list[str]):
-        res = await self.http.aget(f"{self.cfg['binance_rest']}/api/v3/ticker/price",
+        res = await self.http_px.aget(f"{self.cfg['binance_rest']}/api/v3/ticker/price",
                                    {"symbols": json.dumps(symbols, separators=(",", ":"))})
         return {d["symbol"]: float(d["price"]) for d in res}
 
@@ -678,9 +684,11 @@ class Engine:
                    trade_price=trade_price, trade_ts=ts, canceled_before=bool(o.canceled_ts),
                    state=p.state)
 
-    async def poll_trades(self, mk: Market):
+    async def poll_trades(self, mk: Market, force: bool = False):
         if not mk.condition_id:
             return
+        if not force and self.api.now() - self.ws_last_msg < 5:
+            return                       # лента CLOB жива — data-api не нужен
         try:
             trades = await self.api.get_trades(mk.condition_id)
         except Exception as e:  # noqa: BLE001
@@ -705,8 +713,8 @@ class Engine:
         if not pay:
             log.debug(f"resolve {mk.slug}: ещё не рассчитан")
             return
-        # все сделки до конца рынка уже должны быть учтены
-        await self.poll_trades(mk)
+        # все сделки до конца рынка уже должны быть учтены (секунды, покрытые лентой, пропускаются)
+        await self.poll_trades(mk, force=True)
         mk.resolved = True
         mk.winner = "Up" if pay.get(mk.up_token) == 1 else "Down"
         for o in self.orders.values():
@@ -936,12 +944,83 @@ async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
         backoff = min(backoff * 2, 30)
 
 
+RTDS_SYMBOL = {"btcusdt": "BTCUSDT", "ethusdt": "ETHUSDT", "solusdt": "SOLUSDT", "xrpusdt": "XRPUSDT"}
+
+
+def parse_rtds_price(msg: dict):
+    """-> [(SYMBOL, price, ts_ms|None)] из сообщения RTDS crypto_prices."""
+    if not isinstance(msg, dict) or msg.get("topic") != "crypto_prices":
+        return []
+    p = msg.get("payload") or {}
+    sym = RTDS_SYMBOL.get(str(p.get("symbol", "")).lower())
+    if not sym:
+        return []
+    out = []
+    if "value" in p or "price" in p:
+        out.append((sym, float(p.get("value", p.get("price"))), p.get("timestamp")))
+    for pt in p.get("data") or []:                       # снимок при подписке
+        if isinstance(pt, dict) and "value" in pt:
+            out.append((sym, float(pt["value"]), pt.get("timestamp")))
+    return out
+
+
+async def rtds_price_loop(eng: Engine, stop: asyncio.Event):
+    """Цены Binance через RTDS Polymarket: сервер Polymarket доступен даже там, где Binance режут."""
+    wanted = {v: k for k, v in RTDS_SYMBOL.items()}
+    syms = [wanted[s] for s in eng.cfg["assets"].values() if s in wanted]
+    backoff = 1
+    while not stop.is_set():
+        ws, pinger = None, None
+        try:
+            ws = await WebSocket.connect(eng.cfg["rtds_url"])
+            await ws.send(json.dumps({"action": "subscribe", "subscriptions": [
+                {"topic": "crypto_prices", "type": "update", "filters": s} for s in syms]}))
+            backoff = 1
+
+            async def ping():
+                while True:
+                    await asyncio.sleep(5)
+                    await ws.send("ping")
+            pinger = asyncio.ensure_future(ping())
+            got_any = False
+            while not stop.is_set():
+                raw = await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"])
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                pts = parse_rtds_price(msg)
+                for sym, px, _ in pts[-1:]:                 # снимок: берём последнюю точку
+                    eng.prices.add(sym, eng.api.now(), px)
+                    eng.prices.source = "rtds"
+                if pts and not got_any:
+                    got_any = True
+                    eng.info("RTDS: цены идут")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            eng.count("rtds_price_reconnect")
+            n = eng.counters["rtds_price_reconnect"]
+            msg = f"RTDS цены: обрыв #{n}: {type(e).__name__}: {e}"
+            (eng.info if n in (1, 2, 3, 10) or n % 50 == 0 else log.debug)(msg)
+        finally:
+            if pinger:
+                pinger.cancel()
+            if ws:
+                await ws.close()
+        try:
+            await asyncio.wait_for(stop.wait(), backoff)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, 30)
+
+
 async def binance_rest_loop(eng: Engine, stop: asyncio.Event):
-    """Запасной вариант: опрос REST, если поток молчит больше 5 секунд."""
+    """Запасной вариант: опрос REST раз в секунду, если потоки молчат."""
     syms = list(eng.cfg["assets"].values())
     errors = 0
     while not stop.is_set():
-        if eng.api.now() - eng.prices.last_update > 5:
+        if eng.api.now() - eng.prices.last_update > eng.cfg["rest_fallback_after_s"]:
             try:
                 px = await eng.api.get_prices(syms)
                 now = eng.api.now()
@@ -1000,8 +1079,11 @@ async def run(cfg: dict, out: Path):
     eng.info(f"Старт маркет-мейкер-симулятора: {', '.join(a.upper() for a in cfg['assets'])}, "
              f"{cfg['shares']} акций на ногу, пара = 1 − {cfg['edge']}, счёт ${eng.acct.cash:.2f}")
     log.debug("Настройки: " + json.dumps(cfg, ensure_ascii=False))
-    loops = [main_loop(eng, stop), move_watch(eng, stop), binance_ws_loop(eng, stop),
-             binance_rest_loop(eng, stop)]
+    loops = [main_loop(eng, stop), move_watch(eng, stop), binance_rest_loop(eng, stop)]
+    if cfg["use_binance_ws"]:
+        loops.append(binance_ws_loop(eng, stop))
+    if cfg["use_rtds_prices"]:
+        loops.append(rtds_price_loop(eng, stop))
     if cfg["use_clob_ws"]:
         loops.append(clob_ws_loop(eng, stop))
     tasks = [asyncio.ensure_future(x) for x in loops]
@@ -1133,8 +1215,8 @@ async def diag(cfg: dict, seconds: int = 60):
             toks += [str(t) for t in _as_list(m.get("clobTokenIds"))]
     syms = list(cfg["assets"].values())
     burl = cfg["binance_ws"] + "?streams=" + "/".join(f"{x.lower()}@aggTrade" for x in syms)
-    buckets = {"binance_ws": [0] * (seconds // 10), "clob_ws": [0] * (seconds // 10),
-               "clob_trades": [0] * (seconds // 10)}
+    buckets = {"binance_ws": [0] * (seconds // 10), "rtds_prices": [0] * (seconds // 10),
+               "clob_ws": [0] * (seconds // 10), "clob_trades": [0] * (seconds // 10)}
     t0 = time.time()
     errors = []
 
@@ -1149,6 +1231,12 @@ async def diag(cfg: dict, seconds: int = 60):
                 except asyncio.TimeoutError:
                     break
                 i = min(int((time.time() - t0) // 10), len(buckets[name]) - 1)
+                if name == "rtds_prices":            # считаем только сообщения с ценой
+                    try:
+                        if not parse_rtds_price(json.loads(raw)):
+                            continue
+                    except ValueError:
+                        continue
                 buckets[name][i] += 1
                 if name == "clob_ws" and "last_trade_price" in raw:
                     buckets["clob_trades"][i] += raw.count("last_trade_price")
@@ -1169,13 +1257,17 @@ async def diag(cfg: dict, seconds: int = 60):
         return out
 
     print(f"Диагностика {seconds} с (сообщений за каждые 10 с)...")
+    wanted = {v: k for k, v in RTDS_SYMBOL.items()}
+    rsub = json.dumps({"action": "subscribe", "subscriptions": [
+        {"topic": "crypto_prices", "type": "update", "filters": wanted[x]} for x in syms if x in wanted]})
     res = await asyncio.gather(
         reader("binance_ws", burl, None),
+        reader("rtds_prices", cfg["rtds_url"], rsub),
         reader("clob_ws", cfg["clob_ws"], json.dumps({"assets_ids": toks, "type": "market"}) if toks else None),
         rest())
     for k, v in buckets.items():
         print(f"  {k:<12} {v}")
-    print(f"  binance REST, мс: {res[2]}")
+    print(f"  binance REST, мс: {res[3]}")
     for e in errors:
         print(f"  ОШИБКА {e}")
     frozen = [k for k, v in buckets.items() if k != "clob_trades" and v and v[0] > 0 and 0 in v[1:]]
