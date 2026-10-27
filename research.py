@@ -29,6 +29,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
+import fvmodel
 from net import Http
 
 HERE = Path(__file__).resolve().parent
@@ -63,11 +64,19 @@ class Klines:
         self.http, self.base = http, base
         self.close: dict[str, dict[int, float]] = defaultdict(dict)
         self.requests = 0
+        self._logs: dict[str, dict[int, float]] = {}
+
+    def funcs(self, symbol: str):
+        d = self._logs.get(symbol)
+        if d is None or len(d) != len(self.close[symbol]):
+            d = {k: math.log(v) for k, v in self.close[symbol].items() if v > 0}
+            self._logs[symbol] = d
+        return fvmodel.series_funcs(d)
 
     async def load(self, symbol: str, start: int, end: int):
         t = start
         while t < end:
-            rows = await self.http.aget(f"{self.base}/api/v3/klines",
+            rows = await aget_retry(self.http, f"{self.base}/api/v3/klines",
                                         {"symbol": symbol, "interval": "1s",
                                          "startTime": t * 1000, "limit": 1000})
             self.requests += 1
@@ -106,6 +115,35 @@ PRICE_B = ([0.2, 0.4, 0.6, 0.8, 0.9, 0.95, 1.01], ["<0.2", "0.2-0.4", "0.4-0.6",
                                                  "0.8-0.9", "0.9-0.95", "≥0.95"])
 EDGE_B = ([-0.10, -0.03, 0.0, 0.03, 0.10, 9], ["<-10¢", "-10..-3¢", "-3..0¢", "0..3¢", "3..10¢", ">10¢"])
 Z_B = ([-1.5, -0.5, 0.5, 1.5, 99], ["сильно против", "против", "около нуля", "за", "сильно за"])
+
+
+def rule_check(kl, markets: dict, winners: dict) -> str:
+    """Какое правило расчёта совпадает с реальными итогами (по 1-секундным ценам Binance)."""
+    stat = {r: [0, 0, 0, 0] for r in fvmodel.RULES}     # n, ok, n явных, ok явных
+    for slug, t in markets.items():
+        win = winners.get(slug)
+        if win not in ("Up", "Down"):
+            continue
+        at, avg = kl.funcs(SYMBOL[t["asset"]])
+        for rule in fvmodel.RULES:
+            d = fvmodel.final_diff(rule, at, avg, t["start"], t["end"])
+            if d is None:
+                continue
+            ok = (d >= 0) == (win == "Up")
+            st = stat[rule]
+            st[0] += 1
+            st[1] += ok
+            if abs(d) * 1e4 >= 1:
+                st[2] += 1
+                st[3] += ok
+    L = ["\n--- КАКОЕ ПРАВИЛО РАСЧЁТА СОВПАДАЕТ С РЕАЛЬНЫМИ ИТОГАМИ (цены Binance 1с) ---",
+         f"{'правило':<24}{'совпало':>16}{'в явных окнах (≥1 б.п.)':>26}"]
+    names = {"spot": "spot (цена в конце)", "t60": "t60 (средн. 60 с)", "wt": "wt (средн. всего окна)"}
+    for rule, (n, ok, cn, cok) in stat.items():
+        if n:
+            cl = f"{cok}/{cn} = {cok / cn:.1%}" if cn else "-"
+            L.append(f"{names[rule]:<24}{f'{ok}/{n} = {ok / n:.1%}':>16}{cl:>22}")
+    return "\n".join(L)
 
 
 def analyse(rows: list[dict]) -> str:
@@ -151,14 +189,45 @@ def analyse(rows: list[dict]) -> str:
         if xs:
             L.append(f"{k / 10:.1f}-{(k + 1) / 10:.1f}     {len(xs):>7}{sum(x['win'] for x in xs) / len(xs):>8.0%} "
                      f"{statistics.mean(x['price'] for x in xs):>11.3f}")
+    for key, title in (("p_t60", "правило t60"), ("p_wt", "правило wt")):
+        xs_all = [r for r in rows if r.get(key) is not None]
+        if not xs_all:
+            continue
+        L.append(f"\n--- калибровка: {title} ---")
+        L.append(f"{'P модели':<12}{'сделок':>7}{'реально':>9}{'цена рынка':>12}")
+        g = defaultdict(list)
+        for r in xs_all:
+            g[min(int(r[key] * 10), 9)].append(r)
+        for k in range(10):
+            xs = g.get(k)
+            if xs:
+                L.append(f"{k / 10:.1f}-{(k + 1) / 10:.1f}     {len(xs):>7}{sum(x['win'] for x in xs) / len(xs):>8.0%} "
+                         f"{statistics.mean(x['price'] for x in xs):>11.3f}")
     return "\n".join(L)
+
+
+async def aget_retry(http, url, params, tries: int = 8):
+    """Повтор с нарастающей паузой: Polymarket и Binance отвечают 429 при частых запросах."""
+    delay = 2.0
+    for i in range(tries):
+        try:
+            return await http.aget(url, params)
+        except Exception as e:  # noqa: BLE001
+            if i == tries - 1:
+                raise
+            msg = str(e)
+            wait = delay * (3 if "429" in msg else 1)
+            print(f"    повтор через {wait:.0f} с ({msg[:60]})", flush=True)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, 60)
 
 
 async def collect(http: Http, wallet: str, max_trades: int, base_data: str) -> list:
     out, off = [], 0
     while off <= 5000 and len(out) < max_trades:
-        page = await http.aget(f"{base_data}/activity", {"user": wallet, "type": "TRADE",
-                                                          "limit": 500, "offset": off})
+        page = await aget_retry(http, f"{base_data}/activity", {"user": wallet, "type": "TRADE",
+                                                                "limit": 500, "offset": off})
+        await asyncio.sleep(0.5)
         if not page:
             break
         out += page
@@ -206,7 +275,7 @@ async def run(args) -> int:
         async def res(slug):
             async with sem:
                 try:
-                    r = await http.aget(f"{args.gamma}/markets", {"slug": slug, "closed": "true"})
+                    r = await aget_retry(http, f"{args.gamma}/markets", {"slug": slug, "closed": "true"}, 5)
                     mk = r[0] if isinstance(r, list) and r else None
                 except Exception:  # noqa: BLE001
                     mk = None
@@ -263,7 +332,14 @@ async def run(args) -> int:
             fee_ps = max(0.0, (t["usdc"] - t["price"] * t["size"]) / t["size"])
             won = (win.lower() == t["outcome"].lower())
             pnl_ps = (1 - t["price"] if won else -t["price"]) - fee_ps
-            rows.append({"price": t["price"], "win": won, "pnl_ps": pnl_ps, "cost": t["usdc"],
+            at, avg = kl.funcs(sym)
+            pr = {}
+            for rule in fvmodel.RULES:
+                p = fvmodel.prob_up(rule, at, avg, t["start"], t["end"], t["ts"] - 1, math.log(s), sig)
+                if p is not None:
+                    pr[rule] = p if is_up else 1 - p
+            rows.append({"p_t60": pr.get("t60"), "p_wt": pr.get("wt"),
+                         "price": t["price"], "win": won, "pnl_ps": pnl_ps, "cost": t["usdc"],
                          "pnl": pnl_ps * t["size"], "tau": tau, "edge": p_side - t["price"],
                          "z_side": z if is_up else -z, "taker": taker, "p_model": p_side,
                          "move_bps": (s / s0 - 1) * 1e4, "sigma": sig, "asset": t["asset"],
@@ -271,6 +347,7 @@ async def run(args) -> int:
         print(f"  разобрано {len(rows)} (пропущено: {dict(skipped)}), {time.time() - t0:.0f} с", flush=True)
         if rows:
             txt = f"\n################ {name} ################\n" + analyse(rows)
+            txt += "\n" + rule_check(kl, {t["slug"]: t for t in trades}, winners)
             print(txt, flush=True)
             report.append(txt)
             dataset += rows

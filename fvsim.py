@@ -39,6 +39,7 @@ import time
 from collections import deque, defaultdict
 from pathlib import Path
 
+import fvmodel
 import mmsim
 from core import resolution_payouts, walk_book, _as_list
 from mmsim import Api, PriceFeed, best, utc
@@ -59,6 +60,11 @@ DEFAULTS = {
         {"name": "edge10", "min_edge": 0.10},
         {"name": "edge4-late", "min_edge": 0.04, "max_tau": 90},
         {"name": "edge4-early", "min_edge": 0.04, "min_tau": 90},
+        # те же пороги, но вероятность по правилам TWAP (см. fvmodel.py)
+        {"name": "t60-edge4", "min_edge": 0.04, "rule": "t60"},
+        {"name": "t60-edge7", "min_edge": 0.07, "rule": "t60"},
+        {"name": "wt-edge4", "min_edge": 0.04, "rule": "wt"},
+        {"name": "wt-edge7", "min_edge": 0.07, "rule": "wt"},
     ],
     "min_tau": 8,
     "min_price": 0.05,
@@ -140,7 +146,11 @@ class Sampler:
     def __init__(self, prices: PriceFeed, keep_s: int = 1800):
         self.prices = prices
         self.series: dict[tuple, dict[int, float]] = defaultdict(dict)   # (sym, src) -> {сек: цена}
+        self.logs: dict[tuple, dict[int, float]] = defaultdict(dict)     # то же в логарифмах
         self.keep_s = keep_s
+        self._sig_cache: dict = {}
+        self._avg_cache: dict = {}
+        self._cache_sec = 0
 
     def tick(self, now: float, fresh_s: float = 2.5):
         sec = int(now)
@@ -148,9 +158,11 @@ class Sampler:
             if h and now - h[-1][0] <= fresh_s:
                 d = self.series[(sym, src)]
                 d[sec] = h[-1][1]
+                self.logs[(sym, src)][sec] = math.log(h[-1][1])
                 if len(d) > self.keep_s + 60:
-                    for k in [k for k in d if k < sec - self.keep_s]:
-                        del d[k]
+                    for dd in (d, self.logs[(sym, src)]):
+                        for k in [k for k in dd if k < sec - self.keep_s]:
+                            del dd[k]
 
     def value_at(self, sym: str, src: str, sec: int, tol: int = 2):
         d = self.series.get((sym, src), {})
@@ -162,7 +174,30 @@ class Sampler:
     def sources(self, sym: str):
         return [src for (s, src) in self.series if s == sym]
 
+    def funcs(self, sym: str, src: str, now: float):
+        """at/avg по лог-ценам источника; средние кэшируются в пределах секунды."""
+        sec = int(now)
+        if sec != self._cache_sec:
+            self._cache_sec, self._avg_cache = sec, {}
+        at, avg0 = fvmodel.series_funcs(self.logs.get((sym, src), {}))
+        cache = self._avg_cache
+
+        def avg(a, b):
+            k = (sym, src, int(a), int(b))
+            if k not in cache:
+                cache[k] = avg0(a, b)
+            return cache[k]
+        return at, avg
+
     def sigma(self, sym: str, now: float, window: int) -> float | None:
+        k = (sym, int(now), window)
+        if k not in self._sig_cache:
+            if len(self._sig_cache) > 50:
+                self._sig_cache.clear()
+            self._sig_cache[k] = self._sigma(sym, now, window)
+        return self._sig_cache[k]
+
+    def _sigma(self, sym: str, now: float, window: int) -> float | None:
         vals = []
         sec = int(now)
         for src in self.sources(sym):
@@ -264,11 +299,12 @@ class Variant:
 
 # ======================================================================= движок
 
-TRADE_COLS = ["time_utc", "variant", "asset", "window", "slug", "side", "tau", "ratio_bps", "sigma",
+TRADE_COLS = ["time_utc", "variant", "rule", "asset", "window", "slug", "side", "tau", "ratio_bps", "sigma",
               "p_model", "seen_ask", "fill_vwap", "shares", "cost", "fee", "edge_seen", "edge_fill",
               "book_ms", "sources"]
-SNAP_COLS = ["t", "asset", "window", "slug", "tau", "ratio_bps", "sigma", "p_up", "up_bid", "up_ask",
-             "down_bid", "down_ask", "sources"]
+SNAP_COLS = ["t", "asset", "window", "slug", "tau", "ratio_bps", "sigma", "p_spot", "p_t60", "p_wt",
+             "up_bid", "up_ask", "down_bid", "down_ask", "sources"]
+OUT_COLS = ["slug", "asset", "window", "start", "winner", "d_spot_bps", "d_t60_bps", "d_wt_bps"]
 
 
 class Engine:
@@ -286,6 +322,7 @@ class Engine:
         self.pending: set = set()
         self.last_snap = 0.0
         self.resolve_next: dict[str, float] = {}
+        self._csv_checked: set = set()
         self._load()
 
     # ---- служебное
@@ -297,6 +334,13 @@ class Engine:
 
     def _csv(self, name, cols, row):
         p = self.out / name
+        if name not in self._csv_checked:
+            self._csv_checked.add(name)
+            if p.exists():
+                with p.open() as f:
+                    head = f.readline().strip().split(",")
+                if head != cols:                     # формат поменялся — старый файл в сторону
+                    os.replace(p, p.with_name(p.stem + f"_old_{int(self.api.now())}" + p.suffix))
         new = not p.exists()
         with p.open("a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)
@@ -365,24 +409,41 @@ class Engine:
                     if v is not None:
                         m.s0[src] = v
 
+    def _src_funcs(self, m: Mkt, sym: str, src: str, now: float):
+        at0, avg = self.sampler.funcs(sym, src, now)
+        s0 = m.s0.get(src)
+
+        def at(t):
+            if int(t) == int(m.start) and s0:
+                return math.log(s0)              # старт сохраняется в state.json (переживает рестарт)
+            return at0(t)
+        return at, avg
+
     def model(self, m: Mkt):
-        """-> (p_up, ratio, sigma, n_sources) или None."""
+        """-> ({правило: P(Up)}, ratio, sigma, n_sources) или None.
+        Источник участвует, только если у него есть цена на старте окна."""
         sym = self.cfg["assets"][m.asset]
         now = self.api.now()
-        ratios = []
-        for src, s0 in m.s0.items():
-            h = self.prices.hist.get((sym, src))
-            if h and now - h[-1][0] <= 3 and s0 > 0:
-                ratios.append(h[-1][1] / s0)
-        if len(ratios) < self.cfg["min_sources"]:
-            return None
         sig = self.sampler.sigma(sym, now, self.cfg["sigma_window_s"])
         if sig is None:
             return None
         sig = max(sig, self.cfg["sigma_floor"])
-        r = statistics.median(ratios)
-        tau = m.end - now
-        return p_up(r, sig, tau), r, sig, len(ratios)
+        ratios, probs = [], {r: [] for r in fvmodel.RULES}
+        for src, s0 in m.s0.items():
+            h = self.prices.hist.get((sym, src))
+            if not (h and now - h[-1][0] <= 3 and s0 > 0):
+                continue
+            ratios.append(h[-1][1] / s0)
+            at, avg = self._src_funcs(m, sym, src, now)
+            x = math.log(h[-1][1])
+            for rule in fvmodel.RULES:
+                p = fvmodel.prob_up(rule, at, avg, m.start, m.end, now, x, sig)
+                if p is not None:
+                    probs[rule].append(p)
+        if len(ratios) < self.cfg["min_sources"]:
+            return None
+        pr = {r: statistics.median(v) for r, v in probs.items() if v}
+        return pr, statistics.median(ratios), sig, len(ratios)
 
     # ---- решения
     def decide(self):
@@ -399,26 +460,33 @@ class Engine:
             if mo is None:
                 self.count("no_model")
                 continue
-            pu, r, sig, nsrc = mo
+            pr, r, sig, nsrc = mo
             if snap:
-                self._csv("snapshots.csv", SNAP_COLS, {
-                    "t": round(now, 2), "asset": m.asset, "window": m.window, "slug": m.slug,
-                    "tau": round(tau, 1), "ratio_bps": round((r - 1) * 1e4, 3), "sigma": f"{sig:.3e}",
-                    "p_up": round(pu, 4), "up_bid": self.book.bid.get(m.up, ""),
-                    "up_ask": self.book.ask.get(m.up, ""), "down_bid": self.book.bid.get(m.down, ""),
-                    "down_ask": self.book.ask.get(m.down, ""), "sources": nsrc})
+                row = {"t": round(now, 2), "asset": m.asset, "window": m.window, "slug": m.slug,
+                       "tau": round(tau, 1), "ratio_bps": round((r - 1) * 1e4, 3), "sigma": f"{sig:.3e}",
+                       "up_bid": self.book.bid.get(m.up, ""), "up_ask": self.book.ask.get(m.up, ""),
+                       "down_bid": self.book.bid.get(m.down, ""), "down_ask": self.book.ask.get(m.down, ""),
+                       "sources": nsrc}
+                for rule in fvmodel.RULES:
+                    row[f"p_{rule}"] = round(pr[rule], 4) if rule in pr else ""
+                self._csv("snapshots.csv", SNAP_COLS, row)
             if tau < cfg["min_tau"]:
                 continue
-            for side, tok, p in (("Up", m.up, pu), ("Down", m.down, 1 - pu)):
+            for side, tok in (("Up", m.up), ("Down", m.down)):
                 ask = self.book.ask.get(tok)
                 if ask is None or not (cfg["min_price"] <= ask <= cfg["max_price"]):
                     continue
                 if now - self.book.t.get(tok, 0) > 30:
                     continue                                   # стакан давно не обновлялся
-                edge = p - ask - fee(ask, cfg["taker_fee_coef"])
+                f_ask = fee(ask, cfg["taker_fee_coef"])
                 want = []
                 for v in self.variants.values():
                     sp = v.spec
+                    rule = sp.get("rule", "spot")
+                    if rule not in pr:
+                        continue
+                    p = pr[rule] if side == "Up" else 1 - pr[rule]
+                    edge = p - ask - f_ask
                     if edge < sp["min_edge"]:
                         continue
                     if tau < sp.get("min_tau", 0) or tau > sp.get("max_tau", 1e9):
@@ -426,14 +494,14 @@ class Engine:
                     ent = v.entries.get(tok, [])
                     if len(ent) >= cfg["max_entries_per_side"] or (ent and now - ent[-1] < cfg["entry_gap_s"]):
                         continue
-                    want.append(v)
+                    want.append((v, p, edge))
                 if want and (tok not in self.pending):
                     self.pending.add(tok)
-                    for v in want:
+                    for v, _, _ in want:
                         v.entries.setdefault(tok, []).append(now)   # бронируем, чтобы не дублировать
-                    asyncio.ensure_future(self.execute(m, side, tok, ask, p, edge, r, sig, nsrc, tau, want))
+                    asyncio.ensure_future(self.execute(m, side, tok, ask, r, sig, nsrc, tau, want))
 
-    async def execute(self, m, side, tok, ask, p, edge, r, sig, nsrc, tau, variants):
+    async def execute(self, m, side, tok, ask, r, sig, nsrc, tau, items):
         cfg = self.cfg
         try:
             t0 = time.perf_counter()
@@ -445,7 +513,7 @@ class Engine:
                 return
             ms = (time.perf_counter() - t0) * 1000
             limit = min(ask + cfg["fill_tolerance"], cfg["max_price"])
-            for v in variants:
+            for v, p, edge in items:
                 shares = max(5.0, cfg["stake_usd"] / ask)
                 f = walk_book(bk, "BUY", shares, limit, cfg["taker_fee_coef"])
                 if f.shares <= 0:
@@ -469,7 +537,8 @@ class Engine:
                                  "cost": round(cost, 4), "edge_seen": round(edge, 4),
                                  "edge_fill": round(ef, 4), "pnl": None})
                 self._csv("trades.csv", TRADE_COLS, {
-                    "time_utc": utc(self.api.now()), "variant": v.name, "asset": m.asset,
+                    "time_utc": utc(self.api.now()), "variant": v.name,
+                    "rule": v.spec.get("rule", "spot"), "asset": m.asset,
                     "window": m.window, "slug": m.slug, "side": side, "tau": round(tau, 1),
                     "ratio_bps": round((r - 1) * 1e4, 2), "sigma": f"{sig:.3e}", "p_model": round(p, 4),
                     "seen_ask": ask, "fill_vwap": round(f.vwap, 4), "shares": round(f.shares, 2),
@@ -480,6 +549,21 @@ class Engine:
                           f"{tau:.0f}с до конца | BTC/ETH {(r - 1) * 1e4:+.1f} б.п. | счёт ${v.cash:.2f}")
         finally:
             self.pending.discard(tok)
+
+    def rule_check(self, m: Mkt) -> dict:
+        """Итог окна по каждому правилу из НАШИХ цен (медиана по источникам), в б.п."""
+        sym = self.cfg["assets"][m.asset]
+        out = {}
+        for rule in fvmodel.RULES:
+            ds = []
+            for src in m.s0:
+                at, avg = self._src_funcs(m, sym, src, self.api.now())
+                d = fvmodel.final_diff(rule, at, avg, m.start, m.end)
+                if d is not None:
+                    ds.append(d)
+            if ds:
+                out[rule] = statistics.median(ds) * 1e4
+        return out
 
     # ---- итоги
     async def resolve(self):
@@ -497,9 +581,20 @@ class Engine:
                 continue
             m.resolved = True
             m.winner = "Up" if pay.get(m.up) == 1 else "Down"
-            self._csv("outcomes.csv", ["slug", "asset", "window", "start", "winner"],
-                      {"slug": m.slug, "asset": m.asset, "window": m.window, "start": m.start,
-                       "winner": m.winner})
+            rc = self.rule_check(m)
+            row = {"slug": m.slug, "asset": m.asset, "window": m.window, "start": m.start,
+                   "winner": m.winner}
+            for rule in fvmodel.RULES:
+                if rule in rc:
+                    d = rc[rule]
+                    ok = (d >= 0) == (m.winner == "Up")
+                    row[f"d_{rule}_bps"] = round(d, 3)
+                    self.count(f"rule_{rule}_n")
+                    self.count(f"rule_{rule}_ok", int(ok))
+                    if abs(d) >= 1.0:                       # «явные» окна, где правило не на грани
+                        self.count(f"rule_{rule}_clear_n")
+                        self.count(f"rule_{rule}_clear_ok", int(ok))
+            self._csv("outcomes.csv", OUT_COLS, row)
             tot = []
             for v in self.variants.values():
                 pnl_m = 0.0
@@ -664,6 +759,17 @@ def report(out: Path) -> str:
         ef = f"{statistics.mean(t['edge_fill'] for t in tr) * 100:+.1f}¢" if tr else "-"
         L.append(f"{name:<14}{eq:>9.2f}{v['realized']:>+9.2f}{len(tr):>8}{wr:>9}{roi:>8}"
                  f"{es:>16}{ef:>15}{c.get('miss_' + name, 0):>10}")
+    if c.get("rule_spot_n") or c.get("rule_t60_n") or c.get("rule_wt_n"):
+        L += ["", "--- какое правило расчёта совпадает с реальными итогами (по нашим ценам бирж) ---",
+              f"{'правило':<10}{'совпало':>14}{'в явных окнах (≥1 б.п.)':>26}"]
+        names = {"spot": "spot (цена в конце)", "t60": "t60 (средн. 60с)", "wt": "wt (средн. окна)"}
+        for rule in ("spot", "t60", "wt"):
+            n, ok = c.get(f"rule_{rule}_n", 0), c.get(f"rule_{rule}_ok", 0)
+            cn, cok = c.get(f"rule_{rule}_clear_n", 0), c.get(f"rule_{rule}_clear_ok", 0)
+            if n:
+                cl = f"{cok}/{cn} = {cok / cn:.0%}" if cn else "-"
+                L.append(f"{names[rule]:<22}{f'{ok}/{n} = {ok / n:.0%}':>12}{cl:>16}")
+        L.append("Правило с совпадением ~95-100% — то, по которому реально считает Polymarket.")
     # калибровка модели по всем сделкам всех вариантов (уникальные по времени/токену)
     seen, rows = set(), []
     for v in d["variants"].values():

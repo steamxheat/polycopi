@@ -84,6 +84,24 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(fvsim.fee(0.5, 0.07), 0.0175)
 
 
+class RuleTests(unittest.TestCase):
+    def test_rules(self):
+        import fvmodel
+        d = {t: math.log(100.0) for t in range(0, 1000)}
+        for t in range(300, 401):
+            d[t] = math.log(101.0)                 # +1% только в последние 100 с из 300
+        at, avg = fvmodel.series_funcs(d)
+        st, en = 100, 400
+        self.assertGreater(fvmodel.final_diff("spot", at, avg, st, en), 0.009)
+        self.assertGreater(fvmodel.final_diff("t60", at, avg, st, en), 0.009)
+        self.assertAlmostEqual(fvmodel.final_diff("wt", at, avg, st, en), math.log(1.01) / 3, places=6)
+        # за 10 с до конца по t60 почти всё решено даже если цена сейчас откатилась
+        p = fvmodel.prob_up("t60", at, avg, st, en, en - 10, math.log(100.0), 1e-4)
+        self.assertGreater(p, 0.99)
+        p = fvmodel.prob_up("spot", at, avg, st, en, en - 10, math.log(100.0), 1e-4)
+        self.assertAlmostEqual(p, 0.5, places=6)
+
+
 class EngineTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -100,8 +118,10 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         feed(eng, api, START + 200, lambda t: wiggle(t) if t < START + 150 else 100000 * 1.003)
         m = eng.markets[SLUG]
         self.assertEqual(set(m.s0), {"coinbase_ws", "okx_ws"})
-        pu, r, sig, n = eng.model(m)
-        self.assertGreater(pu, 0.97)                                    # +30 б.п., 100 с до конца
+        pr, r, sig, n = eng.model(m)
+        self.assertGreater(pr["spot"], 0.97)                            # +30 б.п., 100 с до конца
+        self.assertGreater(pr["t60"], 0.97)
+        self.assertGreater(pr["wt"], 0.9)
         self.assertEqual(n, 2)
         # рынок отстаёт: Up продают по 0.80
         eng.book.on_event({"event_type": "price_change", "price_changes": [
@@ -122,7 +142,8 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         eng.decide()
         await asyncio.sleep(0.01)
         self.assertEqual(api.book_calls, 1)
-        # расчёт
+        # расчёт (цены докручиваем до конца окна)
+        feed(eng, api, START + 305, lambda t: 100000 * 1.003)
         api.t = START + 320
         api.closed[SLUG] = gamma_market("Up")
         await eng.resolve()
@@ -134,11 +155,39 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         rows = list(csv.DictReader((self.tmp / "trades.csv").open()))
         self.assertEqual(len(rows), 2)
         self.assertTrue((self.tmp / "snapshots.csv").exists())
-        self.assertIn("Up", (self.tmp / "outcomes.csv").read_text())
+        out = list(csv.DictReader((self.tmp / "outcomes.csv").open()))
+        self.assertEqual(out[0]["winner"], "Up")
+        self.assertGreater(float(out[0]["d_spot_bps"]), 25)          # +30 б.п. к концу
+        self.assertEqual(eng.counters["rule_t60_ok"], 1)
+        snap = list(csv.DictReader((self.tmp / "snapshots.csv").open()))
+        self.assertIn("p_wt", snap[0])
         eng.save()
         txt = fvsim.report(self.tmp)
         self.assertIn("e10", txt)
         self.assertIn("калибровка", txt)
+        self.assertIn("какое правило", txt)
+
+    async def test_twap_variant_and_csv_rotation(self):
+        (self.tmp / "snapshots.csv").write_text("old,header\n1,2\n")
+        eng, api = make_engine(self.tmp, variants=[{"name": "t60", "min_edge": 0.05, "rule": "t60"},
+                                                    {"name": "spot", "min_edge": 0.05}])
+        # минуту перед стартом цена была на 20 б.п. ниже, на старте прыгнула вверх и стоит
+        feed(eng, api, START - 10, lambda t: 100000 * (1 + 2e-5 * math.sin(t)) * (0.998 if t < START - 1 else 1))
+        await eng.discover()
+        feed(eng, api, START + 30, lambda t: 100000 * (1 + 2e-5 * math.sin(t)))
+        pr, *_ = eng.model(eng.markets[SLUG])
+        self.assertAlmostEqual(pr["spot"], 0.5, delta=0.15)     # по споту — «ничего не было»
+        self.assertGreater(pr["t60"], 0.9)                       # по TWAP база ниже -> Up почти точно
+        eng.book.on_event({"event_type": "book", "asset_id": UP, "bids": [],
+                           "asks": [{"price": "0.70", "size": "50"}]}, api.t)
+        api.books[UP] = book(asks=[(0.70, 50)])
+        eng.decide()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(eng.variants["t60"].trades), 1)
+        self.assertEqual(len(eng.variants["spot"].trades), 0)
+        self.assertTrue(list(self.tmp.glob("snapshots_old_*.csv")))
+        head = (self.tmp / "snapshots.csv").read_text().splitlines()[0]
+        self.assertIn("p_t60", head)
 
     async def test_no_trade_without_edge_and_miss_when_book_moved(self):
         eng, api = make_engine(self.tmp)
@@ -228,6 +277,10 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(rows[0]["win"])
             self.assertGreater(rows[0]["p_model"], 0.9)          # цена ушла на +5 б.п. и держится
             self.assertAlmostEqual(rows[0]["tau"], 50)
+            self.assertIsNotNone(rows[0]["p_t60"])
+            rep = (tmp / "research_report.txt").read_text()
+            self.assertIn("КАКОЕ ПРАВИЛО", rep)
+            self.assertIn("1/1 = 100.0%", rep)
         finally:
             research.Http, research.HERE = old, oldhere
             shutil.rmtree(tmp)
