@@ -535,5 +535,23 @@ class GammaClosedTests(unittest.IsolatedAsyncioTestCase):
             shutil.rmtree(tmp)
 
 
+
+class ComboSkipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_combo_trades_skipped(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            api = FakeApi()
+            api.t = 1793093200.0
+            e = Engine(cfg(), api, tmp, quiet=True)
+            raw = dict(trade(tx="0xcombo"), isCombo=True, outcomeIndex=999)
+            await e.on_trade(raw, "poll")
+            await e.on_trade(raw, "poll")
+            gf = e.leaders["goodfallen"]
+            self.assertEqual(gf.counters.get("skip_combo"), 1)
+            self.assertNotIn("signals", gf.counters)
+        finally:
+            shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

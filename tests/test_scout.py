@@ -74,6 +74,13 @@ class ComputeTests(unittest.TestCase):
         self.assertIn("мейкер", flags_for(maker))
         self.assertLess(maker.days_since_trade, 0.01)
 
+    def test_combo_mm_flagged(self):
+        a = [dict(act(NOW - i * 60, 300, 0.9, 333), isCombo=True, outcomeIndex=999) for i in range(30)]
+        c = [closed(30, 0.9, 333, NOW - DAY, cid=f"k{i}") for i in range(40)]
+        st = compute("0xw", "t", c, [], a, NOW, 30)
+        self.assertGreater(st.combo_share, 0.3)
+        self.assertIn("комбо-MM", flags_for(st))
+
     def test_score_prefers_real_edge(self):
         a = scout.Stats("a", "a", resolved=100, invested=100, roi=0.10, per_day=5)
         b = scout.Stats("b", "b", resolved=100, invested=100, roi=0.02, per_day=5)

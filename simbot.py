@@ -435,6 +435,11 @@ class Engine:
             return
         name = self.names[t.wallet]
         lb = self.leaders[name]
+        if raw.get("isCombo") or str(raw.get("outcomeIndex")) == "999":
+            # комбо (парлей) торгуется через RFQ, стакана нет — повторить нельзя
+            if self.mark_seen(t):
+                self._count("skip_combo", lb)
+            return
         if not self.mark_seen(t):
             self._count(f"dup_{source}", lb)
             self.debug(f"DUP   {name} {source} {t.side} {t.outcome} {t.price} x{t.size} tx={t.tx[:12]}")

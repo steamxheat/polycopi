@@ -62,6 +62,7 @@ class Stats:
     trades_seen: int = 0
     days_since_trade: float = 999.0
     hidden_losses: int = 0
+    combo_share: float = 0.0
     score: float = 0.0
     flags: str = ""
 
@@ -138,6 +139,10 @@ def compute(wallet: str, name: str, closed: list, open_pos: list, activity: list
         st.fast_share = sum(1 for r in rows if FAST_RE.search(r[3].split(" ")[0])) / st.resolved
     trades = [a for a in activity if str(a.get("type", "TRADE")) == "TRADE"]
     st.trades_seen = len(trades)
+    is_combo = lambda x: bool(x.get("isCombo")) or str(x.get("outcomeIndex")) == "999"
+    combo_n = sum(1 for a in trades if is_combo(a)) + sum(1 for p in closed + open_pos if is_combo(p))
+    total_n = len(trades) + len(closed) + len(open_pos)
+    st.combo_share = combo_n / total_n if total_n else 0.0
     if trades:
         tss = [_ts(a.get("timestamp")) for a in trades]
         st.days_since_trade = max(0.0, (now - max(tss)) / 86400)
@@ -174,6 +179,8 @@ def flags_for(st: Stats) -> str:
         f.append("мейкер")           # копировать бесполезно
     if st.fast_share > 0.5 and st.per_day > 200:
         f.append("бот-HFT")
+    if st.combo_share > 0.3:
+        f.append("комбо-MM")         # продаёт парлеи через RFQ — скопировать нельзя
     if st.median_trade_usd > 5000:
         f.append("кит")
     if st.days_since_trade > 3:
@@ -283,14 +290,14 @@ async def run(args) -> int:
     out = HERE / "scout_candidates.json"
     out.write_text(json.dumps([asdict(r) for r in sorted(results, key=lambda r: -r.score)],
                               ensure_ascii=False, indent=1))
-    excluded = {"мейкер", "бот-HFT", "неактивен", "кит"}
+    excluded = {"мейкер", "бот-HFT", "неактивен", "кит", "комбо-MM"}
     good = [r for r in results
             if r.score > -1e8 and r.winrate >= args.min_winrate and r.roi > 0
             and not (set(r.flags.split(",")) & excluded)]
     good.sort(key=lambda r: -r.score)
     print(f"\nГотово за {time.time() - t0:.0f} с, запросов {sc.requests}, ошибок {sc.errors}.")
     print(f"Прошли фильтр (винрейт ≥ {args.min_winrate:.0%}, ROI > 0, ≥ {args.min_resolved} позиций "
-          f"за {args.days:g} дн., не мейкер/HFT/кит/неактивен): {len(good)}\n")
+          f"за {args.days:g} дн., не мейкер/HFT/кит/комбо/неактивен): {len(good)}\n")
     print(fmt_table(good[:args.show]))
     print("\nМетки: фаворит = в среднем покупает по ≥0.85 (высокий винрейт мало что значит), "
           "скрыв.проигр = много проигрышей, которых не видно на профиле.")
