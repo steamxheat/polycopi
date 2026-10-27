@@ -1,7 +1,11 @@
 {
   "leaders": {
     "goodfallen": "0x0ca4e9d27ff826a109ecbf74754fb66b93f277a6",
-    "almach": "0x3725d52f3c252e8374999cc8617292ea2608ad88"
+    "almach": "0x3725d52f3c252e8374999cc8617292ea2608ad88",
+    "primm": {"address": "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029", "poll_interval_s": 3},
+    "kch123": {"address": "0x6a72f61820b26b1fe4d956e17b6dc2a1ea3033ee", "poll_interval_s": 3},
+    "BreakTheBank": {"address": "0xf0318c32136c2db7fec88b84869aee6a1106c80c", "poll_interval_s": 3},
+    "omnibus-076daa": {"address": "0x076daa87c4fe1a85402a9b6b8e0a866224388d4c", "poll_interval_s": 2}
   },
   "start_cash": 100,
   "usd_per_trade": 2,
@@ -14,5 +18,8 @@
   "use_rtds": true,
   "use_polling": true,
   "poll_interval_s": 1.5,
-  "status_every_s": 60
+  "status_every_s": 60,
+  "log_level_console": "INFO",
+  "log_max_mb": 20,
+  "log_backups": 10
 }

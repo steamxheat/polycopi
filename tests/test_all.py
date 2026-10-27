@@ -149,19 +149,19 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.counters["copied_buy"], 1)
         self.assertEqual(e.counters["dup_poll"], 1)
         self.assertEqual(e.counters["merged_fill"], 1)
-        pos = e.real.positions[DOWN]
+        pos = e.leaders["goodfallen"].real.positions[DOWN]
         # $2 / 0.84 = 2.38 акций < мин. 5 -> поднимаем до 5; 3 по 0.85 + 2 по 0.86
         self.assertAlmostEqual(pos.shares, 5)
-        self.assertAlmostEqual(e.stats["slip"][0], (0.854 - 0.84) * 100, places=6)
+        self.assertAlmostEqual(e.leaders["goodfallen"].stats["slip"][0], (0.854 - 0.84) * 100, places=6)
 
         api.t = 1793093420
         api.markets[SLUG] = [(1793093410, market("Down"))]
         await e.resolve_once()
-        self.assertEqual(e.real.positions, {})
+        self.assertEqual(e.leaders["goodfallen"].real.positions, {})
         cost = 3 * .85 + 2 * .86 + 0.07 * (3 * .85 * .15 + 2 * .86 * .14)
-        self.assertAlmostEqual(e.real.realized, 5 - cost, places=6)
+        self.assertAlmostEqual(e.leaders["goodfallen"].real.realized, 5 - cost, places=6)
         ideal_cost = 5 * .84 + 0.07 * 5 * .84 * .16
-        self.assertAlmostEqual(e.ideal.realized, 5 - ideal_cost, places=6)
+        self.assertAlmostEqual(e.leaders["goodfallen"].ideal.realized, 5 - ideal_cost, places=6)
 
         e.save_state()
         rows = list(csv.DictReader((self.tmp / "trades.csv").open()))
@@ -171,7 +171,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("цена опоздания", txt)
         # перезапуск подхватывает состояние
         e2 = Engine(cfg(), api, self.tmp, quiet=True)
-        self.assertAlmostEqual(e2.real.realized, e.real.realized)
+        self.assertAlmostEqual(e2.leaders["goodfallen"].real.realized, e.leaders["goodfallen"].real.realized)
 
     async def test_skips(self):
         api, e = self._engine()
@@ -200,7 +200,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         api.books[api.current_key] = book(asks=[(0.85, 100)])
         await e.on_trade(t, "rtds")
         self.assertEqual(e.counters.get("skip_no_cash"), 1)
-        self.assertAlmostEqual(e.real.cash, 3)
+        self.assertAlmostEqual(e.leaders["goodfallen"].real.cash, 3)
 
     async def test_sell_proportional(self):
         api, e = self._engine()
@@ -213,7 +213,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         api.current_key = parse_trade(s).key
         api.books[api.current_key] = book(bids=[(0.89, 100)])
         await e.on_trade(s, "rtds")
-        self.assertAlmostEqual(e.real.positions[DOWN].shares, 2.5)  # лидер продал половину
+        self.assertAlmostEqual(e.leaders["goodfallen"].real.positions[DOWN].shares, 2.5)  # лидер продал половину
         self.assertEqual(e.counters["copied_sell"], 1)
 
     async def test_resim_from_recording(self):
@@ -229,14 +229,14 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         api.markets[SLUG] = [(1793093410, market("Down"))]
         await e.resolve_once()
         e.save_state()
-        base = e.real.realized
+        base = e.leaders["goodfallen"].real.realized
         out = await resim(cfg(), self.tmp, self.tmp / "resim")
         self.assertIn("Реализованный PnL", out)
         r = json.loads((self.tmp / "resim" / "state.json").read_text())
-        self.assertAlmostEqual(r["real"]["realized"], base, places=6)   # тот же результат
+        self.assertAlmostEqual(r["leaders"]["goodfallen"]["real"]["realized"], base, places=6)   # тот же результат
         await resim(cfg(max_slippage=0.005), self.tmp, self.tmp / "resim")
         r2 = json.loads((self.tmp / "resim" / "state.json").read_text())
-        self.assertNotAlmostEqual(r2["real"]["realized"], base, places=6)  # другие настройки
+        self.assertNotAlmostEqual(r2["leaders"]["goodfallen"]["real"]["realized"], base, places=6)  # другие настройки
 
 
 # ================================================================== network (локально)
@@ -330,11 +330,183 @@ class NetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(e.counters.get("first_rtds"), 1)
         self.assertEqual(e.counters.get("first_poll"), 1)
         self.assertEqual(e.counters.get("copied_buy"), 2)
-        self.assertIn(DOWN, e.real.positions)
-        self.assertIn(UP, e.real.positions)
+        self.assertIn(DOWN, e.leaders["goodfallen"].real.positions)
+        self.assertIn(UP, e.leaders["goodfallen"].real.positions)
         self.assertNotIn("0xold", json.dumps(e.counters))
         self.assertEqual(sum(1 for r in st.requests if r == "/book"), 2)
         shutil.rmtree(tmp)
+
+
+
+# ================================================================== v2: несколько трейдеров, логи, миграция
+
+AL = "0x3725d52f3c252e8374999cc8617292ea2608ad88"
+PR = "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029"
+
+
+def cfg6(**kw):
+    """Боевой config.json из репозитория (6 трейдеров)."""
+    c = load_config(ROOT / "config.json")
+    c.update({"resolve_every_s": 0}, **kw)
+    return c
+
+
+class MultiLeaderTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def test_config_normalize(self):
+        c = cfg6()
+        self.assertEqual(len(c["leaders"]), 6)
+        self.assertEqual(c["leaders"]["primm"], PR)
+        self.assertEqual(c["leader_poll"][PR], 3)
+        self.assertNotIn(GF, c["leader_poll"])          # строковая запись — общий интервал
+
+    async def test_separate_accounts_same_market(self):
+        api = FakeApi()
+        api.t = 1793093200.0
+        e = Engine(cfg6(), api, self.tmp, quiet=True)
+        self.assertEqual(set(e.leaders), {"goodfallen", "almach", "primm", "kch123",
+                                          "BreakTheBank", "omnibus-076daa"})
+        for w, tx in ((GF, "0xg"), (AL, "0xa")):
+            t = trade(wallet=w, tx=tx)
+            api.current_key = parse_trade(t).key
+            api.books[api.current_key] = book(asks=[(0.85, 100)])
+            await e.on_trade(t, "rtds")
+        gf, al = e.leaders["goodfallen"], e.leaders["almach"]
+        self.assertIn(DOWN, gf.real.positions)
+        self.assertIn(DOWN, al.real.positions)
+        self.assertAlmostEqual(gf.real.cash, al.real.cash)
+        self.assertAlmostEqual(e.leaders["primm"].real.cash, 100)   # чужие сделки не трогают
+        api.t = 1793093420
+        api.markets[SLUG] = [(1793093410, market("Up"))]
+        await e.resolve_once()
+        self.assertEqual(gf.real.losses, 1)
+        self.assertEqual(al.real.losses, 1)
+        e.save_state()
+        txt = report(self.tmp)
+        self.assertIn("трейдер", txt)
+        for n in ("goodfallen", "almach", "primm", "omnibus-076daa"):
+            self.assertIn(f"--- {n}", txt)
+        one = report(self.tmp, "almach")
+        self.assertIn("--- almach", one)
+        self.assertNotIn("--- goodfallen", one)
+
+    async def test_sports_market_not_skipped_after_gamma_end(self):
+        """У спорта endDate из gamma может быть в прошлом, а рынок ещё торгуется."""
+        api = FakeApi()
+        api.t = 1793093200.0
+        e = Engine(cfg6(), api, self.tmp, quiet=True)
+        slug = "cfb-texas-tech-cincinnati-2026-10-25"
+        m = market(None, closed=False)
+        m.update(slug=slug, endDate="2026-10-25T00:00:00Z")
+        api.markets[slug] = [(0, m)]
+        t = trade(wallet=PR, tx="0xp", price=0.60, slug=slug, outcome="Cincinnati")
+        api.current_key = parse_trade(t).key
+        api.books[api.current_key] = book(asks=[(0.61, 100)], bids=[(0.59, 100)])
+        await e.on_trade(t, "poll")
+        self.assertEqual(e.leaders["primm"].counters.get("copied_buy"), 1)
+
+    async def test_resolver_backoff(self):
+        api = FakeApi()
+        api.t = 1793093200.0
+        e = Engine(cfg6(resolve_every_s=20), api, self.tmp, quiet=True)
+        t = trade(tx="0xq")
+        api.current_key = parse_trade(t).key
+        api.books[api.current_key] = book(asks=[(0.85, 100)])
+        await e.on_trade(t, "rtds")
+        api.t = 1793093500
+        api.markets[SLUG] = [(0, market(None))]          # ещё не рассчитан
+        await e.resolve_once()
+        first = e.resolve_next[SLUG] - api.t
+        api.t = e.resolve_next[SLUG]
+        await e.resolve_once()
+        self.assertGreater(e.resolve_next[SLUG] - api.t, first)   # интервал растёт
+
+    async def test_detailed_logs(self):
+        simbot.setup_logging(self.tmp, cfg6(), quiet=True)
+        api = FakeApi()
+        api.t = 1793093200.0
+        e = Engine(cfg6(), api, self.tmp)
+        t = trade(tx="0xlog", usdc=4.24704)
+        api.current_key = parse_trade(t).key
+        api.books[api.current_key] = book(asks=[(0.85, 3), (0.86, 50)], bids=[(0.83, 10)])
+        await e.on_trade(t, "rtds")
+        t2 = trade(tx="0xlog2", asset=UP, outcome="Up", price=0.16)
+        api.current_key = parse_trade(t2).key
+        api.books[api.current_key] = book(asks=[(0.40, 100)])
+        await e.on_trade(t2, "rtds")
+        e.log_status()
+        for h in simbot.log.handlers:
+            h.flush()
+        txt = (self.tmp / "bot.log").read_text()
+        for needle in ("FILL  goodfallen [rtds] BUY Down @0.84", "fee_coef 0.070",
+                       "BOOK  goodfallen Down bid 0.83 / ask 0.85", "BUY  goodfallen",
+                       "SKIP goodfallen", "no_liquidity_in_limit", "СТАТУС"):
+            self.assertIn(needle, txt)
+        decs = [json.loads(l) for l in (self.tmp / "decisions.jsonl").read_text().splitlines()]
+        self.assertEqual([d["action"] for d in decs], ["BUY", "SKIP"])
+        self.assertEqual(decs[0]["book"]["best_ask"], 0.85)
+        self.assertEqual(decs[0]["book"]["spread_c"], 2.0)
+        self.assertEqual(decs[0]["levels_taken"], 2)
+        rows = list(csv.DictReader((self.tmp / "trades.csv").open()))
+        self.assertEqual(rows[0]["best_bid"], "0.83")
+        self.assertEqual(rows[0]["leader_fee_coef"], "0.0700")
+        self.assertEqual(rows[0]["tx"], "0xlog")
+        simbot.log.handlers.clear()
+
+    async def test_migration_from_v1_state(self):
+        """Старый общий счёт с сервера раскладывается по трейдерам без потерь."""
+        p_gf = {"asset": DOWN, "shares": 5, "cost": 4.3, "slug": SLUG, "condition_id": "c",
+                "outcome": "Down", "title": "BTC", "leader": "goodfallen", "end_ts": None}
+        p_al = dict(p_gf, asset=UP, outcome="Up", cost=1.0, leader="almach")
+        v1 = {"started": 1793000000, "saved": 1793090000,
+              "real": {"cash": 100 - 4.3 - 1.0 + 0.7 - 0.4, "start_cash": 100,
+                       "positions": {DOWN: p_gf, UP: p_al}, "realized": 0.3, "fees": 0.1,
+                       "wins": 1, "losses": 1},
+              "ideal": {"cash": 95, "start_cash": 100, "positions": {DOWN: p_gf}, "realized": 0.5,
+                        "fees": 0, "wins": 1, "losses": 0},
+              "counters": {"signals": 4}, "stats": {"lag": [1], "book_ms": [], "slip": [1.2],
+                                                     "fee_coef": []},
+              "end_cache": {}}
+        (self.tmp / "state.json").write_text(json.dumps(v1))
+        old_cols = ["time_utc", "leader", "source", "action", "reason", "market", "outcome",
+                    "leader_price", "leader_size", "lag_s", "book_ms", "best_price", "our_vwap",
+                    "slip_cents", "our_shares", "our_cost", "fee", "pnl", "cash", "equity_real",
+                    "equity_ideal"]
+        with (self.tmp / "trades.csv").open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=old_cols)
+            w.writeheader()
+            w.writerow({"leader": "goodfallen", "action": "BUY", "fee": "0.05"})
+            w.writerow({"leader": "goodfallen", "action": "SETTLE", "reason": "win", "pnl": "0.7"})
+            w.writerow({"leader": "almach", "action": "BUY", "fee": "0.05"})
+            w.writerow({"leader": "almach", "action": "SETTLE", "reason": "loss", "pnl": "-0.4"})
+        api = FakeApi()
+        api.t = 1793093200.0
+        e = Engine(cfg6(), api, self.tmp, quiet=True)
+        gf, al = e.leaders["goodfallen"], e.leaders["almach"]
+        self.assertAlmostEqual(gf.real.realized, 0.7)
+        self.assertAlmostEqual(al.real.realized, -0.4)
+        self.assertEqual((gf.real.wins, al.real.losses), (1, 1))
+        self.assertAlmostEqual(gf.real.cash, 100 + 0.7 - 4.3)
+        self.assertAlmostEqual(al.real.cash, 100 - 0.4 - 1.0)
+        self.assertIn(DOWN, gf.real.positions)
+        self.assertIn(UP, al.real.positions)
+        self.assertIn(DOWN, gf.ideal.positions)
+        self.assertAlmostEqual(e.leaders["primm"].real.cash, 100)
+        self.assertEqual(e.counters["signals"], 4)
+        self.assertTrue(list(self.tmp.glob("state_v1_backup_*.json")))   # старое не потеряно
+        self.assertTrue((self.tmp / "trades_v1.csv").exists())
+        self.assertFalse((self.tmp / "trades.csv").exists())
+        e.save_state()
+        e2 = Engine(cfg6(), api, self.tmp, quiet=True)                   # повторный старт
+        self.assertAlmostEqual(e2.leaders["goodfallen"].real.realized, 0.7)
+        self.assertEqual(len(list(self.tmp.glob("state_v1_backup_*.json"))), 1)
+        txt = report(self.tmp)
+        self.assertIn("разделён по трейдерам", txt)
 
 
 if __name__ == "__main__":
