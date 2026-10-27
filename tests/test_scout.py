@@ -70,6 +70,8 @@ class ComputeTests(unittest.TestCase):
         self.assertEqual(st.fast_share, 1.0)
         self.assertEqual(st.taker_share, 1.0)
         self.assertIn("фаворит", flags_for(st))
+        busy = compute("0xw", "t", c, [], [act(NOW - i * 60, 5, 0.5, 10) for i in range(400)], NOW, 30)
+        self.assertIn("частый", flags_for(busy))
         maker = compute("0xw", "t", c, [], [act(NOW - i * 60, 2.5, 0.5, 5) for i in range(20)], NOW, 30)
         self.assertIn("мейкер", flags_for(maker))
         self.assertLess(maker.days_since_trade, 0.01)

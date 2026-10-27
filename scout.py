@@ -181,6 +181,8 @@ def flags_for(st: Stats) -> str:
         f.append("бот-HFT")
     if st.combo_share > 0.3:
         f.append("комбо-MM")         # продаёт парлеи через RFQ — скопировать нельзя
+    if st.per_day > 400:
+        f.append("частый")           # сотни сделок в день: копия всегда опаздывает
     if st.median_trade_usd > 5000:
         f.append("кит")
     if st.days_since_trade > 3:
@@ -290,14 +292,15 @@ async def run(args) -> int:
     out = HERE / "scout_candidates.json"
     out.write_text(json.dumps([asdict(r) for r in sorted(results, key=lambda r: -r.score)],
                               ensure_ascii=False, indent=1))
-    excluded = {"мейкер", "бот-HFT", "неактивен", "кит", "комбо-MM"}
+    excluded = {"мейкер", "бот-HFT", "неактивен", "кит", "комбо-MM", "частый", "фаворит"}
     good = [r for r in results
-            if r.score > -1e8 and r.winrate >= args.min_winrate and r.roi > 0
+            if r.score > -1e8 and r.winrate >= args.min_winrate and r.roi >= args.min_roi
             and not (set(r.flags.split(",")) & excluded)]
     good.sort(key=lambda r: -r.score)
     print(f"\nГотово за {time.time() - t0:.0f} с, запросов {sc.requests}, ошибок {sc.errors}.")
-    print(f"Прошли фильтр (винрейт ≥ {args.min_winrate:.0%}, ROI > 0, ≥ {args.min_resolved} позиций "
-          f"за {args.days:g} дн., не мейкер/HFT/кит/комбо/неактивен): {len(good)}\n")
+    print(f"Прошли фильтр (винрейт ≥ {args.min_winrate:.0%}, ROI ≥ {args.min_roi:.0%}, "
+          f"≥ {args.min_resolved} позиций за {args.days:g} дн., без меток "
+          f"мейкер/HFT/частый/фаворит/кит/комбо/неактивен): {len(good)}\n")
     print(fmt_table(good[:args.show]))
     print("\nМетки: фаворит = в среднем покупает по ≥0.85 (высокий винрейт мало что значит), "
           "скрыв.проигр = много проигрышей, которых не видно на профиле.")
@@ -318,7 +321,9 @@ def main():
     ap.add_argument("--days", type=float, default=30)
     ap.add_argument("--min-winrate", type=float, default=0.8)
     ap.add_argument("--min-resolved", type=int, default=30)
-    ap.add_argument("--max", type=int, default=250, help="сколько кандидатов анализировать")
+    ap.add_argument("--max", type=int, default=600, help="сколько кандидатов анализировать")
+    ap.add_argument("--min-roi", type=float, default=0.05,
+                    help="минимальный ROI: тоньше перевес съест проскальзывание копии")
     ap.add_argument("--pages", type=int, default=2, help="страниц по 50 на каждую таблицу лидеров")
     ap.add_argument("--show", type=int, default=40)
     ap.add_argument("--apply", type=int, default=0, help="добавить N лучших в копи-бот")
