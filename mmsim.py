@@ -76,7 +76,10 @@ DEFAULTS = {
     "taker_fee_rate": 0.07,
     # справедливая цена: "book" — середина стакана (первая версия), "t60" — модель по правилу
     # расчёта Polymarket (средняя Chainlink за последнюю минуту против минуты перед стартом)
+    # "guard" — цена по стакану (рынок откалиброван), а модель t60 = сигнал опасности:
+    # расхождение модели и середины стакана > guard_max_dev -> не котируем и снимаем заявки
     "fair_mode": "book",
+    "guard_max_dev": 0.05,
     "rule": "t60",
     "sigma_window_s": 900,
     "sigma_floor": 2e-5,
@@ -538,7 +541,16 @@ class Engine:
             return
         book_mid = (bb + ba) / 2
         fair = book_mid
-        if cfg["fair_mode"] != "book":
+        if cfg["fair_mode"] == "guard":
+            model = self.model_fair(mk)
+            if model is None:
+                self.count("skip_no_model")
+                return
+            if abs(model - book_mid) > cfg["guard_max_dev"]:
+                self.count("skip_guard")
+                log.debug(f"GUARD {mk.slug}: модель {model:.3f} vs стакан {book_mid:.3f} — не котирую")
+                return
+        elif cfg["fair_mode"] != "book":
             fair = self.model_fair(mk)
             if fair is None:
                 self.count("skip_no_model")
@@ -590,7 +602,7 @@ class Engine:
                     self._cancel(o, "end")
                 continue
             if p.state == "quoting" and ou.filled == 0 and od.filled == 0:
-                if cfg["fair_mode"] != "book":
+                if cfg["fair_mode"] == "t60":
                     fair = self.model_fair(mk)
                     if fair is None:
                         continue
@@ -604,6 +616,16 @@ class Engine:
                     if bb is None or ba is None:
                         continue
                     fair = (bb + ba) / 2
+                    if cfg["fair_mode"] == "guard":
+                        model = self.model_fair(mk)
+                        if model is not None and abs(model - fair) > cfg["guard_max_dev"]:
+                            for o in (ou, od):
+                                self._cancel(o, "guard")
+                            p.state, p.close_reason = "canceled", "guard"
+                            mk.pairs.remove(p.id)
+                            self.count("canceled_on_guard")
+                            log.debug(f"GUARD-СНЯТИЕ #{p.id}: модель {model:.3f} vs стакан {fair:.3f}")
+                            continue
                 if abs(fair - p.fair_up) >= cfg["requote_ticks"] * mk.tick - 1e-9:
                     for o in (ou, od):
                         self._cancel(o, "requote")
@@ -1286,7 +1308,7 @@ async def run(cfg: dict, out: Path):
         except NotImplementedError:
             pass
     eng.info(f"Старт маркет-мейкер-симулятора [справедливая цена: "
-             f"{'стакан' if cfg['fair_mode'] == 'book' else 'модель ' + cfg['rule']}]: "
+             f"{ {'book': 'стакан', 'guard': 'стакан + охрана по модели ' + cfg['rule']}.get(cfg['fair_mode'], 'модель ' + cfg['rule'])}]: "
              f"{', '.join(a.upper() for a in cfg['assets'])}, "
              f"{cfg['shares']} акций на ногу, пара = 1 − {cfg['edge']}, счёт ${eng.acct.cash:.2f}")
     log.debug("Настройки: " + json.dumps(cfg, ensure_ascii=False))

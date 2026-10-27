@@ -113,6 +113,27 @@ class MMTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(od.price, 0.2)                     # Down котируем дёшево, по модели
         self.assertGreater(p.fair_up, 0.75)
 
+    async def test_guard_mode(self):
+        import math
+        e = self.eng(fair_mode="guard", max_mid=0.99)
+        t = START - 700
+        while t <= START + 10:
+            px = 100000 * (1 + 2e-5 * math.sin(t)) * (0.998 if t < START - 1 else 1.0)
+            for src in ("coinbase_ws", "okx_ws"):
+                e.prices.add("BTCUSDT", float(t), px, src)
+            self.api.t = float(t)
+            e.sampler.tick(float(t))
+            t += 1
+        self.api.t = START + 10.0
+        await e.step()                                    # модель ~0.9, стакан 0.50 -> опасно, не котируем
+        self.assertEqual(len(e.markets[SLUG].pairs), 0)
+        self.assertGreaterEqual(e.counters.get("skip_guard", 0), 1)
+        e2 = self.eng(fair_mode="guard", guard_max_dev=0.6)  # модель и стакан «согласны» -> котируем вокруг стакана
+        e2.prices, e2.sampler = e.prices, e.sampler
+        await e2.step()
+        p = e2.pairs[e2.markets[SLUG].pairs[0]]
+        self.assertEqual((e2.orders[p.up].price, e2.orders[p.down].price), (0.48, 0.48))
+
     async def test_floor_tick(self):
         self.assertEqual(floor_tick(0.479999, 0.01), 0.47)
         self.assertEqual(floor_tick(0.48, 0.01), 0.48)
