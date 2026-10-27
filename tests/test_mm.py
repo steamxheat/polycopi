@@ -593,3 +593,26 @@ class BookMoveTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ExamTests(unittest.TestCase):
+    def test_exam_and_rebates(self):
+        from mmsim import exam, Account
+        a = Account(100.0)
+        a.rebates = 1.5
+        base = 1793000000
+        done = []
+        for day in range(9):
+            for k in range(40):
+                win = k % 3 != 0
+                done.append({"asset": "btc" if k % 2 else "eth", "t": base + day * 86400 + k * 600,
+                             "pnl": 0.2 if k % 4 else (0.5 if win else -0.4),
+                             "outcome": "complete" if k % 4 else ("one_leg_win" if win else "one_leg_loss")})
+        d = {"account": a.to_dict(), "counters": {"markets_resolved": 400, "fills": 1500},
+             "done_pairs": done, "started": base, "saved": base + 9 * 86400}
+        txt = exam(d)
+        self.assertIn("ЭКЗАМЕН", txt)
+        self.assertIn("9/9", txt)
+        d["done_pairs"] = done[:10]
+        self.assertIn("❌", exam(d))
+        self.assertEqual(Account.from_dict(a.to_dict()).rebates, 1.5)

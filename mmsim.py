@@ -33,7 +33,7 @@ import signal
 import statistics
 import sys
 import time
-from collections import deque
+from collections import deque, defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +69,11 @@ DEFAULTS = {
     "chase_after_s": 30,
     "chase_max_total": 0.99,        # максимум суммарной цены пары при догонянии
     "maker_fee_coef": 0.0,          # мейкер на Polymarket комиссию не платит
+    # ребейты: Polymarket раздаёт мейкерам 20% комиссии тейкеров (крипто). Доля мейкера ≈ его
+    # fee-equivalent = shares * 0.07 * p * (1-p), так что ребейт ≈ 0.2 * это. В счёт НЕ добавляем,
+    # показываем отдельно: правила программы могут поменяться.
+    "rebate_share": 0.20,
+    "taker_fee_rate": 0.07,
     # справедливая цена: "book" — середина стакана (первая версия), "t60" — модель по правилу
     # расчёта Polymarket (средняя Chainlink за последнюю минуту против минуты перед стартом)
     "fair_mode": "book",
@@ -202,6 +207,7 @@ class Account:
         self.reserved = 0.0                 # под заявками
         self.positions: dict[str, list] = {}   # token -> [shares, cost]
         self.realized = 0.0
+        self.rebates = 0.0                  # оценка ребейтов мейкера (в счёт не входит)
 
     def reserve(self, amount: float) -> bool:
         if amount > self.cash + 1e-9:
@@ -238,13 +244,14 @@ class Account:
 
     def to_dict(self):
         return {"start_cash": self.start_cash, "cash": self.cash, "reserved": self.reserved,
-                "positions": self.positions, "realized": self.realized}
+                "positions": self.positions, "realized": self.realized, "rebates": self.rebates}
 
     @classmethod
     def from_dict(cls, d):
         a = cls(d["start_cash"])
         a.cash, a.reserved, a.realized = d["cash"], d["reserved"], d["realized"]
         a.positions = {k: list(v) for k, v in d["positions"].items()}
+        a.rebates = d.get("rebates", 0.0)
         return a
 
 
@@ -767,6 +774,8 @@ class Engine:
         # резерв этой заявки ещё не освобождён -> покупка покрывается резервом
         reserved_part = 0.0 if o.released else shares * o.price
         self.acct.fill(o.token, shares, o.price, fee, reserved_part)
+        self.acct.rebates += (self.cfg["rebate_share"] * self.cfg["taker_fee_rate"]
+                              * shares * o.price * (1 - o.price))
         o.filled += shares
         if o.first_fill_ts is None:
             o.first_fill_ts = self.api.now()
@@ -1303,6 +1312,52 @@ async def run(cfg: dict, out: Path):
 
 # ======================================================================= report
 
+def exam(d: dict, start_cash: float | None = None) -> str:
+    """Экзамен перед реальными деньгами: каждый пункт ✅ или ❌ (планка из плана)."""
+    a = Account.from_dict(d["account"])
+    c = d.get("counters", {})
+    cash0 = start_cash or a.start_cash
+    done = sorted((x for x in d.get("done_pairs", []) if x["outcome"] != "no_fill"), key=lambda x: x.get("t", 0))
+    hours = max((d["saved"] - d["started"]) / 3600, 0)
+    days = defaultdict(float)
+    for x in done:
+        days[utc(x.get("t", 0))[:10]] += x["pnl"]
+    full_days = sorted(days)[1:-1] if len(days) > 2 else []      # первый и последний день неполные
+    pnl = sum(x["pnl"] for x in done)
+    top5 = sum(sorted((x["pnl"] for x in done), reverse=True)[:5])
+    peak = eq = dd = 0.0
+    for x in done:
+        eq += x["pnl"]
+        peak = max(peak, eq)
+        dd = min(dd, eq - peak)
+    win = sum(1 for x in done if x["outcome"].endswith("one_leg_win"))
+    loss = sum(1 for x in done if x["outcome"].endswith("one_leg_loss"))
+    by_asset = defaultdict(float)
+    for x in done:
+        by_asset[x["asset"]] += x["pnl"]
+    checks = [
+        ("7 дней подряд", hours >= 7 * 24, f"{hours / 24:.1f} дн"),
+        ("≥300 окон", c.get("markets_resolved", 0) >= 300, f"{c.get('markets_resolved', 0)}"),
+        ("≥1000 исполнений", c.get("fills", 0) >= 1000, f"{c.get('fills', 0)}"),
+        ("итог ≥ +5% без ребейтов", pnl >= 0.05 * cash0, f"{pnl:+.2f}$ ({pnl / cash0 * 100:+.1f}%)"),
+        ("плюс ≥5 из 7 полных дней", len(full_days) >= 7 and sum(days[k] > 0 for k in full_days[-7:]) >= 5,
+         f"{sum(days[k] > 0 for k in full_days[-7:])} из {min(len(full_days), 7)}"),
+        ("плюс без 5 лучших пар", pnl - top5 > 0, f"{pnl - top5:+.2f}$"),
+        ("одна нога: проигрышей ≤1.3× выигрышей", win > 0 and loss <= 1.3 * win, f"{win} выигр. / {loss} проигр."),
+        ("плюс и на BTC, и на ETH", len(by_asset) >= 2 and all(v > 0 for v in by_asset.values()),
+         ", ".join(f"{k.upper()} {v:+.2f}$" for k, v in sorted(by_asset.items())) or "-"),
+        ("просадка не глубже −15%", dd >= -0.15 * cash0, f"{dd:+.2f}$ ({dd / cash0 * 100:+.1f}%)"),
+    ]
+    ok = sum(1 for _, good, _ in checks if good)
+    L = [f"=== ЭКЗАМЕН ПЕРЕД РЕАЛЬНЫМИ ДЕНЬГАМИ: {ok}/{len(checks)} ==="]
+    for name, good, val in checks:
+        L.append(f"  {'✅' if good else '❌'} {name:<38} {val}")
+    L.append("  (+ вручную: 48 ч без падений — колонка ↺ в pm2 не растёт)")
+    L.append("  Реальные деньги — только при 9/9. " + ("ВСЁ ✅ — можно обсуждать живой тест на $30–50."
+                                                     if ok == len(checks) else "Пока рано."))
+    return "\n".join(L)
+
+
 def report(out: Path) -> str:
     sp = out / "state.json"
     if not sp.exists():
@@ -1351,6 +1406,8 @@ def report(out: Path) -> str:
         L.append(f"ГЛАВНОЕ ЧИСЛО: одна нога в {one_n / len(done) * 100:.0f}% пар с исполнением. "
                  f"При паре 0.96 стратегия в плюсе, только если убытки «одной ноги» меньше "
                  f"заработка полных пар — смотрите строку «итого».")
+    L.append(f"Ребейты мейкера (оценка, в счёт не входят): +${a.rebates:.2f}")
+    L += ["", exam(d)]
     if hours >= 12 and c.get("markets_resolved", 0) >= 50:
         L.append(f"Прогноз на 30 дней: {a.realized / hours * 24 * 30:+.2f}$ (грубая экстраполяция)")
     else:
