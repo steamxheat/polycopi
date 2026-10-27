@@ -891,7 +891,7 @@ class Engine:
                   f"| PnL {a.realized:+.2f}$ | котировок {c.get('pairs_created', 0)}, полных пар "
                   f"{c.get('pairs_complete', 0)} | итоги: одна нога +{out.get('one_leg_win', 0)}/"
                   f"-{out.get('one_leg_loss', 0)}, рынков {c.get('markets_resolved', 0)} "
-                  f"| рывков {c.get('moves', 0)} | Binance "
+                  f"| рывков {c.get('moves', 0)} | цены: "
                   f"{','.join(self.prices.sources_alive(self.api.now())) or 'нет цен!'}"
                   f" | рывков по стакану {c.get('book_moves', 0)}"
                   f" (обрывов {c.get('binance_ws_reconnect', 0)}) | сделки: лента CLOB "
