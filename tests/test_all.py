@@ -107,6 +107,22 @@ class CoreTests(unittest.TestCase):
         m["clobTokenIds"], m["outcomePrices"] = [UP, DOWN], ["0", "1"]   # и списки тоже
         self.assertEqual(resolution_payouts(m), {UP: 0, DOWN: 1})
 
+    def test_report_forecast_after_twelve_hours(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            real = Portfolio(100, 100)
+            real.realized, real.wins, real.losses = 3, 20, 10
+            ideal = Portfolio(100, 100)
+            (out / "state.json").write_text(json.dumps({
+                "started": 0,
+                "saved": 12 * 3600,
+                "real": real.to_dict(),
+                "ideal": ideal.to_dict(),
+                "counters": {},
+                "stats": {"lag": [], "book_ms": [], "slip": [], "fee_coef": []},
+            }))
+            self.assertIn("Прогноз на 30 дней", report(out))
+
 
 # ================================================================== engine
 
