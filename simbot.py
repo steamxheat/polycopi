@@ -325,6 +325,7 @@ class Engine:
         self.resolve_next: dict[str, float] = {}
         self.resolve_tries: dict[str, int] = {}
         self.feed: dict[str, float] = {"rtds_msgs": 0, "rtds_matched": 0}
+        self.poll_ms: deque = deque(maxlen=500)
         self._load_state()
         for name in cfg["leaders"]:
             if name not in self.leaders:
@@ -695,7 +696,10 @@ class Engine:
     # ------------------------------------------------------------ status
     def status_lines(self) -> list[str]:
         L = []
+        tracked = set(self.cfg["leaders"])
         for lb in self.leaders.values():
+            if lb.name not in tracked:
+                continue
             r = lb.real
             L.append(f"  {lb.name:<14} счёт ${r.equity_at_cost():7.2f} (своб. ${r.cash:6.2f}, "
                      f"позиций {len(r.positions):3d}) | PnL {r.realized:+7.2f}$ "
@@ -707,7 +711,10 @@ class Engine:
         self.info(f"СТАТУС: RTDS сообщений {int(self.feed['rtds_msgs'])}, наших "
                   f"{int(self.feed['rtds_matched'])}, переподключений "
                   f"{self.counters.get('rtds_reconnect', 0)}, ошибок опроса "
-                  f"{self.counters.get('poll_error', 0)}, ждут расчёта {len(self.resolve_tries)}")
+                  f"{self.counters.get('poll_error', 0)}, ждут расчёта {len(self.resolve_tries)}"
+                  + (f", запрос опроса медиана {statistics.median(self.poll_ms):.0f} мс, "
+                     f"90% {sorted(self.poll_ms)[int(len(self.poll_ms) * .9)]:.0f} мс"
+                     if self.poll_ms else ""))
         for line in self.status_lines():
             self.info(line)
 
@@ -777,6 +784,7 @@ async def poll_loop(engine: Engine, wallet: str, stop: asyncio.Event):
             t0 = time.perf_counter()
             items = await api.get_activity(wallet)
             ms = (time.perf_counter() - t0) * 1000
+            engine.poll_ms.append(ms)
             items.sort(key=lambda d: d.get("timestamp", 0))
             new = 0
             for d in items:
@@ -834,6 +842,10 @@ async def run(cfg: dict, out: Path):
     engine = Engine(cfg, Api(cfg), out)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    # каждый HTTP-запрос занимает поток; при 26 трейдерах стандартных 8 потоков не хватало,
+    # опросы вставали в очередь и сигналы приходили с опозданием до 30 с
+    from concurrent.futures import ThreadPoolExecutor
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=max(32, 4 * len(cfg["leaders"]))))
     for s in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(s, stop.set)
@@ -1008,17 +1020,23 @@ def report(out: Path, leader: str | None = None) -> str:
     L = [f"=== Отчёт симуляции копирования ({hours:.1f} ч с первого запуска) ===", "",
          f"{'трейдер':<16}{'счёт':>9}{'PnL':>9}{'%':>7}{'рынков':>8}{'винрейт':>9}"
          f"{'слип¢':>7}{'опозд.$':>9}"]
-    rows = sorted(books.values(), key=lambda b: -b.real.realized)
+    tracked = set((d.get("config") or {}).get("leaders", {})) or set(books)
+    rows = sorted(books.values(), key=lambda b: (b.name not in tracked, -b.real.realized))
     for lb in rows:
         r = lb.real
         st = r.wins + r.losses
         slip = f"{statistics.mean(lb.stats['slip']):+.2f}" if lb.stats["slip"] else "-"
         late = (r.realized - lb.real_base) - lb.ideal.realized
-        L.append(f"{lb.name:<16}{r.equity_at_cost():>9.2f}{r.realized:>+9.2f}"
+        nm = lb.name if lb.name in tracked else f"{lb.name[:13]}(х)"
+        nm = nm[:15]
+        L.append(f"{nm:<16}{r.equity_at_cost():>9.2f}{r.realized:>+9.2f}"
                  f"{r.realized / r.start_cash * 100:>+6.1f}%{st:>8}"
                  f"{(f'{r.wins / st * 100:.0f}%' if st else '-'):>9}"
                  f"{slip:>7}{late:>+9.2f}")
     L.append("")
+    if set(books) - tracked:
+        L.append("(х) — трейдер больше не отслеживается (убран из настроек), цифры на момент удаления.")
+        L.append("")
     if d.get("migrated_from_v1"):
         L.append(f"(Общий счёт разделён по трейдерам {utc(d['migrated_from_v1'])} UTC; "
                  f"«опоздание» для старых трейдеров считается с этого момента.)")

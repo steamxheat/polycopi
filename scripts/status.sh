@@ -8,7 +8,7 @@ for p in json.load(sys.stdin):
         e=p["pm2_env"]; up=(time.time()*1000-e.get("pm_uptime",0))/60000
         print("== %s: %s, работает %.0f мин, перезапусков %s" % (p["name"], e["status"], up, e.get("restart_time",0)))'
 echo; echo "===== КОПИ-БОТ ====="
-python3 simbot.py report 2>&1 | sed -n '1,14p'
+python3 simbot.py report 2>&1 | awk 'NR>2 && /^--- /{exit} {print}'
 echo; echo "===== МАРКЕТ-МЕЙКЕР ====="
 python3 mmsim.py report 2>&1 | head -25
 echo; echo "== последние события маркет-мейкера:"
