@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 pm2 jlist 2>/dev/null | python3 -c '
 import json,sys,time
 for p in json.load(sys.stdin):
-    if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard"):
+    if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard","polymm-fast"):
         e=p["pm2_env"]; up=(time.time()*1000-e.get("pm_uptime",0))/60000
         print("== %s: %s, работает %.0f мин, перезапусков %s" % (p["name"], e["status"], up, e.get("restart_time",0)))'
 echo; echo "===== КОПИ-БОТ ====="
@@ -17,8 +17,10 @@ echo; echo "===== МАРКЕТ-МЕЙКЕР t60 (справедливая цен
 python3 mmsim.py report --out data_mm_t60 2>&1 | head -25
 echo; echo "===== МАРКЕТ-МЕЙКЕР guard (стакан + охрана по модели) ====="
 python3 mmsim.py report --out data_mm_guard 2>&1 | head -25
+echo; echo "===== МАРКЕТ-МЕЙКЕР fast (guard + быстрая реакция) ====="
+python3 mmsim.py report --out data_mm_fast 2>&1 | head -25
 echo; echo "===== СВОЙ БОТ (справедливая цена) ====="
 python3 fvsim.py report 2>&1 | head -12
 pm2 logs polyfv-sim --lines 400 --nostream --raw 2>/dev/null | grep -E "СТАТУС|BUY|ИТОГ|обрыв" | tail -6
 echo; echo "== ошибки (если есть):"
-pm2 logs polycopy-sim polymm-sim polyfv-sim polymm-t60 polymm-guard --err --lines 5 --nostream --raw 2>/dev/null | grep -v '^$' | tail -5 || true
+pm2 logs polycopy-sim polymm-sim polyfv-sim polymm-t60 polymm-guard polymm-fast --err --lines 5 --nostream --raw 2>/dev/null | grep -v '^$' | tail -5 || true

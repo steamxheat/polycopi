@@ -98,6 +98,7 @@ DEFAULTS = {
     "use_clob_ws": True,            # сделки в реальном времени (data-api отстаёт на десятки секунд)
     "order_latency_s": 0.3,         # заявка начинает работать через N с после решения
     "cancel_latency_s": 0.3,        # снятие срабатывает через N с
+    "move_watch_s": 0.2,            # как часто проверять рывки бирж (fast-версия: 0.05)
     "ws_silence_s": 10,
     "use_rtds_prices": False,       # RTDS crypto_prices: Polymarket его выключает
     "use_coinbase_ws": True,
@@ -1292,7 +1293,7 @@ async def move_watch(eng: Engine, stop: asyncio.Event):
     while not stop.is_set():
         eng.check_moves()
         try:
-            await asyncio.wait_for(stop.wait(), 0.2)
+            await asyncio.wait_for(stop.wait(), eng.cfg["move_watch_s"])
         except asyncio.TimeoutError:
             pass
 

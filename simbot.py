@@ -368,7 +368,21 @@ class Engine:
             self.leaders[name] = LeaderBook.from_dict(name, ld)
         self._migrated = d.get("migrated_from_v1")
 
+    def prune(self):
+        """Чистка памяти: бот работает сутками, кэши не должны расти без конца."""
+        now = self.api.now()
+        for lb in self.leaders.values():
+            for k, v in lb.stats.items():
+                if len(v) > 5000:
+                    del v[:-5000]
+        gw = max(float(self.cfg.get("group_window_s", 5)), 60.0)
+        for g in [g for g, ts in self.recent_group.items() if now - ts > gw * 10]:
+            del self.recent_group[g]
+        for slug in [s for s, e in self.end_cache.items() if e < now - 86400]:
+            del self.end_cache[slug]
+
     def save_state(self):
+        self.prune()
         d = {"version": STATE_VERSION, "started": self.started, "saved": self.api.now(),
              "config": self.cfg, "counters": self.counters, "legacy_stats": self.legacy_stats,
              "leaders": {n: lb.to_dict() for n, lb in self.leaders.items()},
