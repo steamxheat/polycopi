@@ -15,7 +15,10 @@ if [ "$1" = "--reset-mm" ]; then
   pm2 stop polymm-sim >/dev/null
   [ -d data_mm ] && mv data_mm "data_mm_old_$(date +%Y%m%d_%H%M)" && echo "== данные маркет-мейкера отложены"
 fi
-pm2 restart polycopy-sim polymm-sim --update-env >/dev/null && pm2 save >/dev/null
-echo "== перезапущено, жду 90 с..."
+# перезапускаем только тех ботов, что сейчас запущены (остановленные не трогаем)
+RUNNING=$(pm2 jlist 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin) if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim") and p["pm2_env"]["status"]=="online"))')
+[ -n "$RUNNING" ] && pm2 restart $RUNNING --update-env >/dev/null && pm2 save >/dev/null
+echo "== перезапущены: ${RUNNING:-никто}"
+echo "== жду 90 с..."
 sleep 90
 bash scripts/status.sh

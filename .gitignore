@@ -5,3 +5,7 @@ data/
 data_mm/
 leaders_extra.json
 scout_candidates.json
+data_fv/
+research_report.txt
+research_trades.jsonl
+fv_config.json
