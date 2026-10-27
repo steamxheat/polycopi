@@ -509,5 +509,31 @@ class MultiLeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("разделён по трейдерам", txt)
 
 
+
+class GammaClosedTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_api_settles_closed_market(self):
+        """Регресс: gamma прячет закрытые рынки без closed=true — позиции не рассчитывались."""
+        st = fp.FakeState()
+        srv, base = fp.start_http(st)
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            c = cfg(clob_url=base, data_url=base, gamma_url=base)
+            api = Api(c)
+            st.markets[SLUG] = market(None, closed=False)
+            self.assertEqual((await api.get_market(SLUG))["slug"], SLUG)   # открытый находится
+            st.markets[SLUG] = market("Down")                              # рынок закрылся
+            self.assertTrue((await api.get_market(SLUG))["closed"])
+            e = Engine(c, api, tmp, quiet=True)
+            # позиция открыта (как на сервере), рынок уже закрыт
+            e.leaders["goodfallen"].real.buy(parse_trade(trade()), 5, 4.25, 0.05, None)
+            await e.resolve_once()
+            gf = e.leaders["goodfallen"]
+            self.assertEqual(gf.real.positions, {})
+            self.assertEqual(gf.real.wins, 1)
+        finally:
+            srv.shutdown()
+            shutil.rmtree(tmp)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

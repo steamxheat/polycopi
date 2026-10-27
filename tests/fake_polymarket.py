@@ -46,8 +46,10 @@ def start_http(state: FakeState):
             elif u.path == "/book":
                 body = state.books.get(q.get("token_id"))
             elif u.path == "/markets":
+                # как настоящая gamma: закрытые рынки видны только с closed=true
                 m = state.markets.get(q.get("slug"))
-                body = [m] if m else []
+                want_closed = q.get("closed") == "true"
+                body = [m] if m and bool(m.get("closed")) == want_closed else []
             else:
                 body = None
             if body is None:

@@ -133,10 +133,16 @@ class Api:
         return await self.http.aget(f"{self.cfg['clob_url']}/book", {"token_id": asset})
 
     async def get_market(self, slug: str) -> dict | None:
-        res = await self.http.aget(f"{self.cfg['gamma_url']}/markets", {"slug": slug})
-        if isinstance(res, list):
-            return res[0] if res else None
-        return res
+        """Gamma по умолчанию НЕ отдаёт закрытые рынки: без closed=true ответ пустой.
+        Поэтому сначала спрашиваем закрытый (нужен для расчёта), потом открытый."""
+        for extra in ({"closed": "true"}, {}):
+            res = await self.http.aget(f"{self.cfg['gamma_url']}/markets", {"slug": slug, **extra})
+            if isinstance(res, list):
+                if res:
+                    return res[0]
+            elif res:
+                return res
+        return None
 
     async def get_activity(self, wallet: str, limit: int = 50) -> list:
         res = await self.http.aget(f"{self.cfg['data_url']}/activity",
