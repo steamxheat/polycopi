@@ -3,3 +3,5 @@ __pycache__/
 data/
 *.log
 data_mm/
+leaders_extra.json
+scout_candidates.json

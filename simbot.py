@@ -74,6 +74,19 @@ def load_config(path: Path) -> dict:
     cfg = dict(DEFAULTS)
     if path.exists():
         cfg.update(json.loads(path.read_text()))
+    # трейдеры, найденные разведчиком (scout.py --apply): отдельный файл, не в git
+    extra = path.parent / "leaders_extra.json"
+    if extra.exists():
+        have = {str(v["address"] if isinstance(v, dict) else v).lower() for v in cfg["leaders"].values()}
+        leaders = dict(cfg["leaders"])
+        for name, v in json.loads(extra.read_text()).items():
+            addr = str(v["address"] if isinstance(v, dict) else v).lower()
+            if addr in have:
+                continue
+            key = name if name not in leaders else f"{name}-{addr[2:8]}"
+            leaders[key] = v
+            have.add(addr)
+        cfg["leaders"] = leaders
     return normalize_leaders(cfg)
 
 
