@@ -69,6 +69,11 @@ DEFAULTS = {
         {"name": "t60-edge10", "min_edge": 0.10, "rule": "t60"},
         {"name": "t60-early", "min_edge": 0.05, "rule": "t60", "min_tau": 90},
         {"name": "t60-late", "min_edge": 0.05, "rule": "t60", "max_tau": 90},
+        # разбор goodfallen/almach: перевес у фаворитов (рынок недооценивает исход с P≥0.7 по t60),
+        # длинные шансы (дешёвые исходы) системно переоценены — их не покупаем
+        {"name": "fav70", "min_edge": 0.03, "rule": "t60", "min_p": 0.70},
+        {"name": "fav70-late", "min_edge": 0.03, "rule": "t60", "min_p": 0.70, "max_tau": 120},
+        {"name": "fav85", "min_edge": 0.03, "rule": "t60", "min_p": 0.85},
     ],
     "min_tau": 8,
     "min_price": 0.05,
@@ -493,6 +498,8 @@ class Engine:
                     edge = p - ask - f_ask
                     if edge < sp["min_edge"]:
                         continue
+                    if not (sp.get("min_p", 0) <= p <= sp.get("max_p", 1)):
+                        continue
                     if tau < sp.get("min_tau", 0) or tau > sp.get("max_tau", 1e9):
                         continue
                     ent = v.entries.get(tok, [])
@@ -741,6 +748,70 @@ async def run(cfg: dict, out: Path):
 
 # ======================================================================= отчёт
 
+TAU_B = [(0, 30, "<30с"), (30, 60, "30-60с"), (60, 120, "1-2м"), (120, 300, "2-5м"), (300, 1e9, ">5м")]
+
+
+def study(out: Path, rule: str = "t60", fee_coef: float = 0.07) -> str:
+    """Карта перевеса по снимкам: если бы мы покупали по ask каждую секунду —
+    сколько бы выиграли в каждой клетке «вероятность модели × время до конца».
+    Снимки не зависят от наших порогов, поэтому это честная проверка модели."""
+    op = out / "outcomes.csv"
+    sp = out / "snapshots.csv"
+    if not op.exists() or not sp.exists():
+        return "Нет snapshots.csv/outcomes.csv — бот должен поработать хотя бы час."
+    win = {r["slug"]: r["winner"] for r in csv.DictReader(op.open())}
+    cells = defaultdict(lambda: [0, 0, 0.0, 0.0, set()])   # n, won, sum ask, sum pnl, рынки
+    col = f"p_{rule}"
+    used = 0
+    with sp.open() as f:
+        for r in csv.DictReader(f):
+            w = win.get(r["slug"])
+            if not w or not r.get(col):
+                continue
+            pu = float(r[col])
+            tau = float(r["tau"])
+            used += 1
+            for side, p, ask in (("Up", pu, r["up_ask"]), ("Down", 1 - pu, r["down_ask"])):
+                if not ask:
+                    continue
+                ask = float(ask)
+                if not 0.02 <= ask <= 0.98:
+                    continue
+                pb = min(int(p * 10), 9)
+                tb = next(lbl for a, b, lbl in TAU_B if a <= tau < b)
+                c = cells[(pb, tb)]
+                won = (w == side)
+                c[0] += 1
+                c[1] += won
+                c[2] += ask
+                c[3] += (1.0 if won else 0.0) - ask - fee_coef * ask * (1 - ask)
+                c[4].add(r["slug"])
+    if not used:
+        return "Пока нет рассчитанных рынков со снимками."
+    L = [f"=== Карта перевеса по снимкам (правило {rule}), снимков {used}, рынков {len(win)} ===",
+         "В клетке: перевес на акцию после комиссии тейкера, если покупать по ask (¢), и [рынков].",
+         "Плюс в клетке с ≥30 рынками — кандидат в стратегию. Меньше 30 рынков — шум.", "",
+         f"{'P модели':<10}" + "".join(f"{lbl:>16}" for _, _, lbl in TAU_B)]
+    for pb in range(10):
+        row = f"{pb / 10:.1f}-{(pb + 1) / 10:.1f}  "
+        for _, _, lbl in TAU_B:
+            c = cells.get((pb, lbl))
+            row += f"{f'{c[3] / c[0] * 100:+.1f}¢ [{len(c[4])}]':>16}" if c and c[0] else f"{'-':>16}"
+        L.append(row)
+    L += ["", f"{'P модели':<10}{'снимков':>9}{'выиграл':>9}{'ср.ask':>8}{'перевес':>9}{'рынков':>8}"]
+    for pb in range(10):
+        n = sum(cells[(pb, lbl)][0] for _, _, lbl in TAU_B if (pb, lbl) in cells)
+        if not n:
+            continue
+        wn = sum(cells[(pb, lbl)][1] for _, _, lbl in TAU_B if (pb, lbl) in cells)
+        sa = sum(cells[(pb, lbl)][2] for _, _, lbl in TAU_B if (pb, lbl) in cells)
+        sp_ = sum(cells[(pb, lbl)][3] for _, _, lbl in TAU_B if (pb, lbl) in cells)
+        mk = set().union(*(cells[(pb, lbl)][4] for _, _, lbl in TAU_B if (pb, lbl) in cells))
+        L.append(f"{pb / 10:.1f}-{(pb + 1) / 10:.1f}   {n:>9}{wn / n:>8.0%} {sa / n:>7.3f}"
+                 f"{sp_ / n * 100:>+8.1f}¢{len(mk):>8}")
+    return "\n".join(L)
+
+
 def report(out: Path) -> str:
     sp = out / "state.json"
     if not sp.exists():
@@ -820,13 +891,16 @@ async def check(cfg: dict) -> bool:
 
 def main():
     ap = argparse.ArgumentParser(description="Симулятор справедливой цены для крипто Up/Down")
-    ap.add_argument("cmd", choices=["run", "report", "check"])
+    ap.add_argument("cmd", choices=["run", "report", "check", "study"])
+    ap.add_argument("--rule", default="t60", choices=["spot", "t60", "wt"])
     ap.add_argument("--config", default=str(HERE / "fv_config.json"))
     ap.add_argument("--out", default=str(HERE / "data_fv"))
     a = ap.parse_args()
     cfg = load_config(Path(a.config))
     if a.cmd == "run":
         asyncio.run(run(cfg, Path(a.out)))
+    elif a.cmd == "study":
+        print(study(Path(a.out), a.rule))
     elif a.cmd == "report":
         print(report(Path(a.out)))
     else:

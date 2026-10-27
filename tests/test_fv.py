@@ -318,3 +318,26 @@ class KlinesFailTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(1199, kl.close["BTCUSDT"])
         self.assertEqual(kl.failed, 1)                   # кусок 1200-1500 пропущен, но без падения
         self.assertTrue(any("api.binance.com" in c for c in calls))
+
+
+class StudyTests(unittest.TestCase):
+    def test_study_map(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            with (tmp / "outcomes.csv").open("w") as f:
+                f.write("slug,asset,window,start,winner,d_spot_bps,d_t60_bps,d_wt_bps\nA,btc,5m,0,Up,,,\nB,btc,5m,0,Down,,,\n")
+            cols = fvsim.SNAP_COLS
+            with (tmp / "snapshots.csv").open("w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=cols)
+                w.writeheader()
+                w.writerow({"slug": "A", "tau": 20, "p_t60": 0.85, "up_ask": 0.80, "down_ask": 0.22})
+                w.writerow({"slug": "B", "tau": 200, "p_t60": 0.85, "up_ask": 0.80, "down_ask": 0.22})
+            txt = fvsim.study(tmp)
+            self.assertIn("снимков 2", txt)
+            self.assertIn("<30с", txt)
+            self.assertIn("[1]", txt)
+        finally:
+            shutil.rmtree(tmp)
+
+    def test_min_p_filter(self):
+        self.assertTrue(any(v.get("min_p") for v in fvsim.DEFAULTS["variants"]))
