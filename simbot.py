@@ -70,13 +70,13 @@ DEFAULTS = {
 log = logging.getLogger("polycopy")
 
 
-def load_config(path: Path) -> dict:
+def load_config(path: Path, include_extra: bool = True) -> dict:
     cfg = dict(DEFAULTS)
     if path.exists():
         cfg.update(json.loads(path.read_text()))
     # трейдеры, найденные разведчиком (scout.py --apply): отдельный файл, не в git
     extra = path.parent / "leaders_extra.json"
-    if extra.exists():
+    if include_extra and extra.exists():
         have = {str(v["address"] if isinstance(v, dict) else v).lower() for v in cfg["leaders"].values()}
         leaders = dict(cfg["leaders"])
         for name, v in json.loads(extra.read_text()).items():

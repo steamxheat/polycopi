@@ -48,7 +48,7 @@ def market(winner=None, closed=True):
 
 
 def cfg(**kw):
-    c = load_config(ROOT / "config.json")
+    c = load_config(ROOT / "config.json", include_extra=False)
     c.update({"leaders": {"goodfallen": GF}, "resolve_every_s": 0}, **kw)
     return c
 
@@ -346,7 +346,7 @@ PR = "0xd38b71f3e8ed1af71983e5c309eac3dfa9b35029"
 
 def cfg6(**kw):
     """Боевой config.json из репозитория (6 трейдеров)."""
-    c = load_config(ROOT / "config.json")
+    c = load_config(ROOT / "config.json", include_extra=False)
     c.update({"resolve_every_s": 0}, **kw)
     return c
 
