@@ -38,6 +38,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+import fvmodel
 from core import resolution_payouts, _as_list
 from net import Http, HttpError, WebSocket
 
@@ -68,6 +69,12 @@ DEFAULTS = {
     "chase_after_s": 30,
     "chase_max_total": 0.99,        # максимум суммарной цены пары при догонянии
     "maker_fee_coef": 0.0,          # мейкер на Polymarket комиссию не платит
+    # справедливая цена: "book" — середина стакана (первая версия), "t60" — модель по правилу
+    # расчёта Polymarket (средняя Chainlink за последнюю минуту против минуты перед стартом)
+    "fair_mode": "book",
+    "rule": "t60",
+    "sigma_window_s": 900,
+    "sigma_floor": 2e-5,
     "retro_window_s": 15,           # сколько ждём «запоздавшие» сделки по снятым заявкам
     "loop_s": 1.0,
     "trades_poll_s": 1.0,
@@ -373,6 +380,8 @@ class Engine:
         self.ws_intervals: list = []      # [начало, конец] периодов, когда лента CLOB работала
         self.ws_last_msg = 0.0
         self.done_pairs: list[dict] = []      # итоги рассчитанных пар (для отчёта)
+        self.sampler = fvmodel.Sampler(self.prices)
+        self.s0: dict[str, dict] = {}         # slug -> {источник: цена на старте окна}
         self._load()
 
     # ------------------------------------------------------------ io
@@ -478,6 +487,24 @@ class Engine:
                 self.acct.release(o.remaining * o.price)
                 o.released = True
 
+    def model_fair(self, mk: Market):
+        """P(Up) по модели (правило cfg['rule']); None, если данных не хватает
+        (например, бот запущен посреди окна и не видел цену на старте)."""
+        sym = self.cfg["assets"][mk.asset]
+        now = self.api.now()
+        if now < mk.start_ts:
+            return None
+        s0 = self.s0.setdefault(mk.slug, {})
+        for src in self.sampler.sources(sym):
+            if src not in s0:
+                v = self.sampler.value_at(sym, src, int(mk.start_ts), tol=2)
+                if v is not None:
+                    s0[src] = v
+        if not s0:
+            return None
+        return fvmodel.market_prob(self.sampler, self.prices, sym, mk.start_ts, mk.end_ts, s0, now,
+                                   self.cfg["rule"], self.cfg["sigma_window_s"], self.cfg["sigma_floor"])
+
     async def quote(self, mk: Market):
         cfg, now = self.cfg, self.api.now()
         if now < mk.start_ts + cfg["start_after_s"] or now > mk.end_ts - cfg["stop_new_pairs_before_end_s"]:
@@ -502,7 +529,13 @@ class Engine:
         if bb is None or ba is None:
             self.count("skip_empty_book")
             return
-        fair = (bb + ba) / 2
+        book_mid = (bb + ba) / 2
+        fair = book_mid
+        if cfg["fair_mode"] != "book":
+            fair = self.model_fair(mk)
+            if fair is None:
+                self.count("skip_no_model")
+                return
         if not (cfg["min_mid"] <= fair <= cfg["max_mid"]):
             self.count("skip_mid_extreme")
             log.debug(f"SKIP {mk.slug}: fair Up {fair:.3f} вне [{cfg['min_mid']}, {cfg['max_mid']}]")
@@ -535,6 +568,7 @@ class Engine:
                   f"Down {qd:.2f} (очередь {od.queue_ahead:.0f}) = {qu + qd:.2f} | справедл. Up {fair:.3f} "
                   f"| {sec:.0f}с окна | своб. ${self.acct.cash:.2f}")
         self.event(ev="quote", pair=pid, asset=mk.asset, slug=mk.slug, up=qu, down=qd, fair_up=fair,
+                   book_mid=book_mid,
                    up_bid=bb, up_ask=ba, down_bid=dbb, down_ask=dba, q_up=ou.queue_ahead,
                    q_down=od.queue_ahead, sec_in_window=round(sec, 1))
 
@@ -549,15 +583,20 @@ class Engine:
                     self._cancel(o, "end")
                 continue
             if p.state == "quoting" and ou.filled == 0 and od.filled == 0:
-                try:
-                    bu = await self.api.get_book(mk.up_token)
-                except Exception:  # noqa: BLE001
-                    continue
-                bb, _, _ = best(bu, "bids")
-                ba, _, _ = best(bu, "asks")
-                if bb is None or ba is None:
-                    continue
-                fair = (bb + ba) / 2
+                if cfg["fair_mode"] != "book":
+                    fair = self.model_fair(mk)
+                    if fair is None:
+                        continue
+                else:
+                    try:
+                        bu = await self.api.get_book(mk.up_token)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    bb, _, _ = best(bu, "bids")
+                    ba, _, _ = best(bu, "asks")
+                    if bb is None or ba is None:
+                        continue
+                    fair = (bb + ba) / 2
                 if abs(fair - p.fair_up) >= cfg["requote_ticks"] * mk.tick - 1e-9:
                     for o in (ou, od):
                         self._cancel(o, "requote")
@@ -862,9 +901,11 @@ class Engine:
     def drop_old(self):
         for slug in [s for s, m in self.markets.items() if m.resolved]:
             del self.markets[slug]
+            self.s0.pop(slug, None)
 
     # ------------------------------------------------------------ cycle
     async def step(self):
+        self.sampler.tick(self.api.now())
         await self.discover()
         live = [m for m in self.markets.values() if not m.resolved]
         for mk in live:
@@ -1235,7 +1276,9 @@ async def run(cfg: dict, out: Path):
             loop.add_signal_handler(s, stop.set)
         except NotImplementedError:
             pass
-    eng.info(f"Старт маркет-мейкер-симулятора: {', '.join(a.upper() for a in cfg['assets'])}, "
+    eng.info(f"Старт маркет-мейкер-симулятора [справедливая цена: "
+             f"{'стакан' if cfg['fair_mode'] == 'book' else 'модель ' + cfg['rule']}]: "
+             f"{', '.join(a.upper() for a in cfg['assets'])}, "
              f"{cfg['shares']} акций на ногу, пара = 1 − {cfg['edge']}, счёт ${eng.acct.cash:.2f}")
     log.debug("Настройки: " + json.dumps(cfg, ensure_ascii=False))
     loops = [main_loop(eng, stop), move_watch(eng, stop), binance_rest_loop(eng, stop)]

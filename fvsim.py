@@ -149,78 +149,7 @@ def setup_logging(out: Path, cfg: dict, quiet: bool = False):
 
 # ======================================================================= цены
 
-class Sampler:
-    """Раз в секунду снимает последнюю цену каждого источника -> посекундные ряды."""
-
-    def __init__(self, prices: PriceFeed, keep_s: int = 1800):
-        self.prices = prices
-        self.series: dict[tuple, dict[int, float]] = defaultdict(dict)   # (sym, src) -> {сек: цена}
-        self.logs: dict[tuple, dict[int, float]] = defaultdict(dict)     # то же в логарифмах
-        self.keep_s = keep_s
-        self._sig_cache: dict = {}
-        self._avg_cache: dict = {}
-        self._cache_sec = 0
-
-    def tick(self, now: float, fresh_s: float = 2.5):
-        sec = int(now)
-        for (sym, src), h in self.prices.hist.items():
-            if h and now - h[-1][0] <= fresh_s:
-                d = self.series[(sym, src)]
-                d[sec] = h[-1][1]
-                self.logs[(sym, src)][sec] = math.log(h[-1][1])
-                if len(d) > self.keep_s + 60:
-                    for dd in (d, self.logs[(sym, src)]):
-                        for k in [k for k in dd if k < sec - self.keep_s]:
-                            del dd[k]
-
-    def value_at(self, sym: str, src: str, sec: int, tol: int = 2):
-        d = self.series.get((sym, src), {})
-        for k in range(tol + 1):
-            if sec - k in d:
-                return d[sec - k]
-        return None
-
-    def sources(self, sym: str):
-        return [src for (s, src) in self.series if s == sym]
-
-    def funcs(self, sym: str, src: str, now: float):
-        """at/avg по лог-ценам источника; средние кэшируются в пределах секунды."""
-        sec = int(now)
-        if sec != self._cache_sec:
-            self._cache_sec, self._avg_cache = sec, {}
-        at, avg0 = fvmodel.series_funcs(self.logs.get((sym, src), {}))
-        cache = self._avg_cache
-
-        def avg(a, b):
-            k = (sym, src, int(a), int(b))
-            if k not in cache:
-                cache[k] = avg0(a, b)
-            return cache[k]
-        return at, avg
-
-    def sigma(self, sym: str, now: float, window: int) -> float | None:
-        k = (sym, int(now), window)
-        if k not in self._sig_cache:
-            if len(self._sig_cache) > 50:
-                self._sig_cache.clear()
-            self._sig_cache[k] = self._sigma(sym, now, window)
-        return self._sig_cache[k]
-
-    def _sigma(self, sym: str, now: float, window: int) -> float | None:
-        vals = []
-        sec = int(now)
-        for src in self.sources(sym):
-            d = self.series[(sym, src)]
-            xs = [(k, d[k]) for k in range(sec - window, sec + 1) if k in d]
-            if len(xs) < window * 0.3:
-                continue
-            rets = []
-            for (k1, a), (k2, b) in zip(xs, xs[1:]):
-                if a > 0 and b > 0 and k2 > k1:
-                    rets.append(math.log(b / a) / math.sqrt(k2 - k1))
-            if len(rets) > 30:
-                vals.append(statistics.pstdev(rets))
-        return statistics.median(vals) if vals else None
+Sampler = fvmodel.Sampler
 
 
 # ======================================================================= модель данных

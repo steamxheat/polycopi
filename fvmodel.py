@@ -16,6 +16,8 @@ avg(a, b) -> средняя лог-цена за секунды [a, b) (или N
 from __future__ import annotations
 
 import math
+import statistics
+from collections import defaultdict
 
 RULES = ("spot", "t60", "wt")
 TW = 60
@@ -94,3 +96,100 @@ def series_funcs(d: dict, tol: int = 2, min_cover: float = 0.6):
             return None
         return sum(xs) / len(xs)
     return at, avg
+
+
+class Sampler:
+    """Раз в секунду снимает последнюю цену каждого источника -> посекундные ряды."""
+
+    def __init__(self, prices, keep_s: int = 1800):
+        self.prices = prices
+        self.series: dict[tuple, dict[int, float]] = defaultdict(dict)   # (sym, src) -> {сек: цена}
+        self.logs: dict[tuple, dict[int, float]] = defaultdict(dict)     # то же в логарифмах
+        self.keep_s = keep_s
+        self._sig_cache: dict = {}
+        self._avg_cache: dict = {}
+        self._cache_sec = 0
+
+    def tick(self, now: float, fresh_s: float = 2.5):
+        sec = int(now)
+        for (sym, src), h in self.prices.hist.items():
+            if h and now - h[-1][0] <= fresh_s:
+                d = self.series[(sym, src)]
+                d[sec] = h[-1][1]
+                self.logs[(sym, src)][sec] = math.log(h[-1][1])
+                if len(d) > self.keep_s + 60:
+                    for dd in (d, self.logs[(sym, src)]):
+                        for k in [k for k in dd if k < sec - self.keep_s]:
+                            del dd[k]
+
+    def value_at(self, sym: str, src: str, sec: int, tol: int = 2):
+        d = self.series.get((sym, src), {})
+        for k in range(tol + 1):
+            if sec - k in d:
+                return d[sec - k]
+        return None
+
+    def sources(self, sym: str):
+        return [src for (s, src) in self.series if s == sym]
+
+    def funcs(self, sym: str, src: str, now: float):
+        """at/avg по лог-ценам источника; средние кэшируются в пределах секунды."""
+        sec = int(now)
+        if sec != self._cache_sec:
+            self._cache_sec, self._avg_cache = sec, {}
+        at, avg0 = series_funcs(self.logs.get((sym, src), {}))
+        cache = self._avg_cache
+
+        def avg(a, b):
+            k = (sym, src, int(a), int(b))
+            if k not in cache:
+                cache[k] = avg0(a, b)
+            return cache[k]
+        return at, avg
+
+    def sigma(self, sym: str, now: float, window: int) -> float | None:
+        k = (sym, int(now), window)
+        if k not in self._sig_cache:
+            if len(self._sig_cache) > 50:
+                self._sig_cache.clear()
+            self._sig_cache[k] = self._sigma(sym, now, window)
+        return self._sig_cache[k]
+
+    def _sigma(self, sym: str, now: float, window: int) -> float | None:
+        vals = []
+        sec = int(now)
+        for src in self.sources(sym):
+            d = self.series[(sym, src)]
+            xs = [(k, d[k]) for k in range(sec - window, sec + 1) if k in d]
+            if len(xs) < window * 0.3:
+                continue
+            rets = []
+            for (k1, a), (k2, b) in zip(xs, xs[1:]):
+                if a > 0 and b > 0 and k2 > k1:
+                    rets.append(math.log(b / a) / math.sqrt(k2 - k1))
+            if len(rets) > 30:
+                vals.append(statistics.pstdev(rets))
+        return statistics.median(vals) if vals else None
+
+
+def market_prob(sampler, prices, sym, start, end, s0: dict, now, rule="t60",
+                sigma_window=900, sigma_floor=2e-5, fresh_s=3.0):
+    """P(Up) по правилу: медиана по источникам, у которых есть цена на старте окна.
+    prices — PriceFeed (нужен .hist), s0 — {источник: цена на старте}."""
+    sig = sampler.sigma(sym, now, sigma_window)
+    if sig is None:
+        return None
+    sig = max(sig, sigma_floor)
+    ps = []
+    for src, p0 in s0.items():
+        h = prices.hist.get((sym, src))
+        if not (h and now - h[-1][0] <= fresh_s and p0 > 0):
+            continue
+        at0, avg = sampler.funcs(sym, src, now)
+
+        def at(t, at0=at0, p0=p0):
+            return math.log(p0) if int(t) == int(start) else at0(t)
+        p = prob_up(rule, at, avg, start, end, now, math.log(h[-1][1]), sig)
+        if p is not None:
+            ps.append(p)
+    return statistics.median(ps) if ps else None

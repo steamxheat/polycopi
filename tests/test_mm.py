@@ -86,6 +86,33 @@ class MMTests(unittest.IsolatedAsyncioTestCase):
     def eng(self, **kw):
         return Engine(cfg(**kw), self.api, self.tmp, quiet=True)
 
+    async def test_t60_fair_mode(self):
+        import math
+        e = self.eng(fair_mode="t60")
+        # цены биржи: минуту до старта на 20 б.п. ниже, со старта — выше и стоят
+        t = START - 700
+        while t <= START + 10:
+            px = 100000 * (1 + 2e-5 * math.sin(t)) * (0.998 if t < START - 1 else 1.0)
+            for src in ("coinbase_ws", "okx_ws"):
+                e.prices.add("BTCUSDT", float(t), px, src)
+            self.api.t = float(t)
+            e.sampler.tick(float(t))
+            t += 1
+        self.api.t = START + 10.0
+        await e.step()
+        mk = e.markets[SLUG]
+        fair = e.model_fair(mk)
+        self.assertGreater(fair, 0.75)                     # по t60 Up почти решён, стакан 0.50 этого «не знает»
+        self.assertEqual(len(mk.pairs), 0)                 # >0.8 -> за пределами max_mid? проверим ниже
+        e2 = self.eng(fair_mode="t60", max_mid=0.99)
+        e2.prices, e2.sampler = e.prices, e.sampler
+        await e2.step()
+        p = e2.pairs[e2.markets[SLUG].pairs[0]]
+        ou, od = e2.orders[p.up], e2.orders[p.down]
+        self.assertEqual(ou.price, 0.50)                   # остаёмся мейкером: на тик ниже ask 0.51
+        self.assertLess(od.price, 0.2)                     # Down котируем дёшево, по модели
+        self.assertGreater(p.fair_up, 0.75)
+
     async def test_floor_tick(self):
         self.assertEqual(floor_tick(0.479999, 0.01), 0.47)
         self.assertEqual(floor_tick(0.48, 0.01), 0.48)
