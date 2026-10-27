@@ -101,7 +101,7 @@ class Klines:
         last_print = 0.0
         while t < end:
             rows = await self._get(symbol, t)
-            if progress and time.time() - last_print > 30:
+            if progress and total > 3600 and time.time() - last_print > 30:
                 last_print = time.time()
                 print(f"    свечи: {(t - start) / total:.0%} ({time.time() - t0:.0f} с)", flush=True)
             if rows is None:                       # не удалось — пропускаем кусок, не падаем

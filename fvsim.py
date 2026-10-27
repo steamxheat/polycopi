@@ -65,6 +65,10 @@ DEFAULTS = {
         {"name": "t60-edge7", "min_edge": 0.07, "rule": "t60"},
         {"name": "wt-edge4", "min_edge": 0.04, "rule": "wt"},
         {"name": "wt-edge7", "min_edge": 0.07, "rule": "wt"},
+        # t60 подтверждён как настоящее правило (98-99% совпадений) — смотрим, где у него перевес
+        {"name": "t60-edge10", "min_edge": 0.10, "rule": "t60"},
+        {"name": "t60-early", "min_edge": 0.05, "rule": "t60", "min_tau": 90},
+        {"name": "t60-late", "min_edge": 0.05, "rule": "t60", "max_tau": 90},
     ],
     "min_tau": 8,
     "min_price": 0.05,
