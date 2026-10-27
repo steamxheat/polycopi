@@ -347,7 +347,7 @@ class MMNetTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             self.assertEqual(e.prices.last("BTCUSDT"), 100200.0)
-            self.assertEqual(e.prices.source, "ws")
+            self.assertEqual(e.prices.source, "binance_ws")
             self.assertGreater(e.prices.move_bps("BTCUSDT", time.time(), 3), 19)
         finally:
             srv.close()
@@ -484,6 +484,84 @@ class RtdsPriceTests(unittest.IsolatedAsyncioTestCase):
             h.get_json(base + "/book", {"token_id": "9"})
         self.assertEqual(st.connections, 3)          # каждый раз новое соединение
         srv.shutdown()
+
+
+
+class MoreFeedsTests(unittest.IsolatedAsyncioTestCase):
+    def test_parsers(self):
+        self.assertEqual(mmsim.parse_coinbase({"type": "ticker", "product_id": "BTC-USD", "price": "79800.5"}),
+                         [("BTCUSDT", 79800.5)])
+        self.assertEqual(mmsim.parse_coinbase({"type": "subscriptions"}), [])
+        self.assertEqual(mmsim.parse_okx({"arg": {"channel": "tickers", "instId": "ETH-USDT"},
+                                          "data": [{"instId": "ETH-USDT", "last": "2310.1"}]}),
+                         [("ETHUSDT", 2310.1)])
+        self.assertEqual(mmsim.parse_okx({"event": "subscribe"}), [])
+
+    def test_sources_kept_apart(self):
+        f = PriceFeed(["BTCUSDT"])
+        f.add("BTCUSDT", 100, 80000, "a")
+        f.add("BTCUSDT", 100.5, 80020, "b")        # другая биржа на 2.5 б.п. дороже — не рывок
+        self.assertLess(f.move_bps("BTCUSDT", 101, 3), 0.01)
+        f.add("BTCUSDT", 101, 80060, "a")          # +7.5 б.п. на одной бирже — рывок
+        self.assertAlmostEqual(f.move_bps("BTCUSDT", 101, 3), 7.5, places=2)
+        self.assertEqual(f.sources_alive(101), ["a", "b"])
+
+    async def test_generic_ws_loop(self):
+        async def handler(reader, writer):
+            await fp.ws_read(reader)
+            writer.write(fp.ws_frame(0x1, json.dumps(
+                {"type": "ticker", "product_id": "BTC-USD", "price": "80000"}).encode()))
+            await writer.drain()
+            while True:
+                await fp.ws_read(reader)
+
+        srv, url = await fp.start_ws(handler)
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            c = cfg(coinbase_ws=url)
+            e = Engine(c, mmsim.Api(c), tmp, quiet=True)
+            stop = asyncio.Event()
+            task = asyncio.ensure_future(mmsim.coinbase_loop(e, stop))
+            await asyncio.sleep(0.3)
+            stop.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self.assertEqual(e.prices.last("BTCUSDT"), 80000)
+            self.assertIn("coinbase_ws", e.prices.sources_alive(time.time()))
+        finally:
+            srv.close()
+            shutil.rmtree(tmp)
+
+
+class BookMoveTests(unittest.IsolatedAsyncioTestCase):
+    async def test_book_move_cancels_unfilled_pair(self):
+        tmp = Path(tempfile.mkdtemp())
+        api = FakeApi()
+        api.markets[SLUG] = gamma_market()
+        try:
+            e = Engine(cfg(), api, tmp, quiet=True)
+            await e.step()
+            mk = e.markets[SLUG]
+            p = e.pairs[mk.pairs[0]]
+            toks = {UP: mk, DN: mk}
+            e.on_book_event({"event_type": "price_change", "price_changes": [
+                {"asset_id": UP, "best_bid": "0.49", "best_ask": "0.51"}]}, toks)
+            api.t += 1
+            # Down: bid .45/.47 -> Up эквивалент 0.54, сдвиг 4¢ >= 3 тиков
+            e.on_book_event({"event_type": "price_change", "price_changes": [
+                {"asset_id": DN, "best_bid": "0.45", "best_ask": "0.47"}]}, toks)
+            self.assertEqual(p.state, "canceled")
+            self.assertEqual(e.orders[p.up].cancel_reason, "book_move")
+            self.assertEqual(e.counters["book_moves"], 1)
+            api.t += 1
+            await e.step()                              # пауза: новых котировок нет
+            self.assertEqual(mk.pairs, [])
+            # снимок стакана тоже понимается
+            e.on_book_event({"event_type": "book", "asset_id": UP,
+                             "bids": [{"price": "0.30", "size": "5"}],
+                             "asks": [{"price": "0.32", "size": "5"}]}, toks)
+        finally:
+            shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

@@ -59,7 +59,9 @@ DEFAULTS = {
     "max_open_pairs_per_market": 1,  # новая пара — только когда прошлая закрыта полностью
     "requote_ticks": 2,             # переставить, если справедливая цена ушла на N тиков
     "move_window_s": 3,             # окно для детекции резкого движения
-    "move_threshold_bps": 8,        # 8 б.п. = 0.08% за move_window_s
+    "move_threshold_bps": 5,        # 5 б.п. = 0.05% за move_window_s
+    "book_move_ticks": 3,           # рывок по стакану Polymarket: середина Up сдвинулась на N тиков
+    "book_move_window_s": 2,
     "cooldown_after_move_s": 10,
     "chase_enabled": False,         # догонять вторую ногу, если первая исполнилась
     "chase_after_s": 30,
@@ -81,7 +83,11 @@ DEFAULTS = {
     "order_latency_s": 0.3,         # заявка начинает работать через N с после решения
     "cancel_latency_s": 0.3,        # снятие срабатывает через N с
     "ws_silence_s": 10,
-    "use_rtds_prices": True,        # цены Binance через сервер Polymarket (RTDS)
+    "use_rtds_prices": False,       # RTDS crypto_prices: Polymarket его выключает
+    "use_coinbase_ws": True,
+    "use_okx_ws": True,
+    "coinbase_ws": "wss://ws-feed.exchange.coinbase.com",
+    "okx_ws": "wss://ws.okx.com:8443/ws/v5/public",
     "use_binance_ws": True,         # прямой поток Binance (может резаться сетью сервера)
     "rtds_url": "wss://ws-live-data.polymarket.com",
     "rest_fallback_after_s": 2,     # опрос REST, если потоки молчат дольше N с
@@ -237,37 +243,49 @@ class Account:
 # ======================================================================= price feed
 
 class PriceFeed:
-    """Цены Binance: история за последние секунды для детекции рывков."""
+    """Цены BTC/ETH из нескольких источников. История хранится по каждому источнику
+    отдельно (у бирж цены чуть различаются), рывок = максимум по источникам."""
 
     def __init__(self, symbols: list[str], keep_s: float = 30):
-        self.hist: dict[str, deque] = {s: deque() for s in symbols}
+        self.symbols = set(symbols)
+        self.hist: dict[tuple, deque] = {}
         self.keep_s = keep_s
         self.last_update = 0.0
         self.source = ""
+        self.seen: dict[str, float] = {}       # источник -> время последней цены
 
-    def add(self, symbol: str, ts: float, price: float):
-        h = self.hist.get(symbol)
-        if h is None:
+    def add(self, symbol: str, ts: float, price: float, source: str = "?"):
+        if symbol not in self.symbols or not price:
             return
+        h = self.hist.setdefault((symbol, source), deque())
         h.append((ts, price))
         while h and ts - h[0][0] > self.keep_s:
             h.popleft()
         self.last_update = max(self.last_update, ts)
+        self.seen[source] = ts
+        self.source = source
 
     def last(self, symbol: str):
-        h = self.hist.get(symbol)
-        return h[-1][1] if h else None
+        best = None
+        for (sym, _), h in self.hist.items():
+            if sym == symbol and h and (best is None or h[-1][0] > best[0]):
+                best = h[-1]
+        return best[1] if best else None
 
     def move_bps(self, symbol: str, now: float, window_s: float) -> float:
         """Максимальное отклонение последней цены от любой цены за окно, в б.п."""
-        h = self.hist.get(symbol)
-        if not h:
-            return 0.0
-        last = h[-1][1]
-        ref = [p for t, p in h if now - t <= window_s]
-        if not ref:
-            return 0.0
-        return max(abs(last - p) / p * 1e4 for p in ref)
+        mx = 0.0
+        for (sym, _), h in self.hist.items():
+            if sym != symbol or not h or now - h[-1][0] > window_s:
+                continue
+            last = h[-1][1]
+            for t, p in h:
+                if now - t <= window_s:
+                    mx = max(mx, abs(last - p) / p * 1e4)
+        return mx
+
+    def sources_alive(self, now: float, within: float = 10) -> list[str]:
+        return sorted(k for k, t in self.seen.items() if now - t <= within)
 
 
 # ======================================================================= API
@@ -348,6 +366,8 @@ class Engine:
         self.resolve_next: dict[str, float] = {}
         self.prices = PriceFeed(list(cfg["assets"].values()))
         self.trade_lag: dict[str, deque] = {"ws": deque(maxlen=2000), "api": deque(maxlen=2000)}
+        self.book_hist: dict[str, deque] = {}
+        self.book_cooldown: dict[str, float] = {}
         self.run_started = api.now()
         self.ws_intervals: list = []      # [начало, конец] периодов, когда лента CLOB работала
         self.ws_last_msg = 0.0
@@ -572,6 +592,59 @@ class Engine:
                             self.count("chased")
                             self.info(f"ДОГОНЯЮ #{p.id} {other.leg}: {other.price:.2f} -> {target:.2f}")
                             self.event(ev="chase", pair=p.id, leg=other.leg, old=other.price, new=target)
+
+    def on_book_event(self, ev: dict, tokens: dict):
+        """Середина стакана Up из ленты CLOB; резкий сдвиг = снять неисполненные пары рынка."""
+        items = ev.get("price_changes") if isinstance(ev.get("price_changes"), list) else [ev]
+        now = self.api.now()
+        for it in items:
+            tok = str(it.get("asset_id") or ev.get("asset_id") or "")
+            mk = tokens.get(tok)
+            if mk is None:
+                continue
+            bb, ba = it.get("best_bid"), it.get("best_ask")
+            if (bb is None or ba is None) and ev.get("event_type") == "book":
+                b1, _, _ = best(ev, "bids")
+                a1, _, _ = best(ev, "asks")
+                bb, ba = b1, a1
+            try:
+                bb, ba = float(bb), float(ba)
+            except (TypeError, ValueError):
+                continue
+            if bb <= 0 or ba <= 0 or ba < bb:
+                continue
+            mid = (bb + ba) / 2
+            if tok == mk.down_token:
+                mid = 1 - mid                       # приводим к цене Up
+            h = self.book_hist.setdefault(mk.slug, deque())
+            h.append((now, mid))
+            while h and now - h[0][0] > self.cfg["book_move_window_s"]:
+                h.popleft()
+            lo, hi = min(p for _, p in h), max(p for _, p in h)
+            if (hi - lo) >= self.cfg["book_move_ticks"] * mk.tick - 1e-9:
+                self.on_book_move(mk, hi - lo)
+                h.clear()
+
+    def on_book_move(self, mk: Market, delta: float):
+        now = self.api.now()
+        if now < self.book_cooldown.get(mk.slug, 0):
+            return
+        self.book_cooldown[mk.slug] = now + self.cfg["cooldown_after_move_s"]
+        n = 0
+        for p, ou, od in list(self.market_orders(mk)):
+            if p.state == "quoting" and ou.filled == 0 and od.filled == 0 and ou.canceled_ts is None:
+                self._cancel(ou, "book_move")
+                self._cancel(od, "book_move")
+                p.state, p.close_reason = "canceled", "book_move"
+                mk.pairs.remove(p.id)
+                n += 1
+        self.cooldown[mk.asset] = max(self.cooldown.get(mk.asset, 0), now + self.cfg["cooldown_after_move_s"])
+        self.count("book_moves")
+        if n:
+            self.count("canceled_on_book_move", n)
+        self.info(f"РЫВОК СТАКАНА {mk.asset.upper()} Up сдвинулся на {delta * 100:.1f}¢ "
+                  f"за {self.cfg['book_move_window_s']}с — снято пар: {n}")
+        self.event(ev="book_move", asset=mk.asset, slug=mk.slug, delta=round(delta, 4), canceled_pairs=n)
 
     def on_price_move(self, asset: str, bps: float):
         cfg, now = self.cfg, self.api.now()
@@ -819,7 +892,8 @@ class Engine:
                   f"{c.get('pairs_complete', 0)} | итоги: одна нога +{out.get('one_leg_win', 0)}/"
                   f"-{out.get('one_leg_loss', 0)}, рынков {c.get('markets_resolved', 0)} "
                   f"| рывков {c.get('moves', 0)} | Binance "
-                  f"{self.prices.source} {'' if not self.prices.last_update else f'{self.api.now() - self.prices.last_update:.0f}с назад'}"
+                  f"{','.join(self.prices.sources_alive(self.api.now())) or 'нет цен!'}"
+                  f" | рывков по стакану {c.get('book_moves', 0)}"
                   f" (обрывов {c.get('binance_ws_reconnect', 0)}) | сделки: лента CLOB "
                   f"{c.get('trades_ws', 0)} (задержка {self._lag('ws')}, обрывов "
                   f"{c.get('clob_ws_reconnect', 0)}), data-api {c.get('trades_api', 0)} "
@@ -848,8 +922,7 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
                 if d.get("e") == "aggTrade":
                     # время приёма по своим часам: при расхождении часов сервера и биржи
                     # окно «рывка» иначе оказывается пустым и рывки не ловятся
-                    eng.prices.add(d["s"], eng.api.now(), float(d["p"]))
-                    eng.prices.source = "ws"
+                    eng.prices.add(d["s"], eng.api.now(), float(d["p"]), "binance_ws")
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -916,7 +989,13 @@ async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
                 except ValueError:
                     continue
                 for ev in (data if isinstance(data, list) else [data]):
-                    if not isinstance(ev, dict) or ev.get("event_type") != "last_trade_price":
+                    if not isinstance(ev, dict):
+                        continue
+                    et = ev.get("event_type")
+                    if et in ("price_change", "book"):
+                        eng.on_book_event(ev, tokens)
+                        continue
+                    if et != "last_trade_price":
                         continue
                     mk = tokens.get(str(ev.get("asset_id")))
                     if mk is None:
@@ -991,8 +1070,7 @@ async def rtds_price_loop(eng: Engine, stop: asyncio.Event):
                     continue
                 pts = parse_rtds_price(msg)
                 for sym, px, _ in pts[-1:]:                 # снимок: берём последнюю точку
-                    eng.prices.add(sym, eng.api.now(), px)
-                    eng.prices.source = "rtds"
+                    eng.prices.add(sym, eng.api.now(), px, "rtds")
                 if pts and not got_any:
                     got_any = True
                     eng.info("RTDS: цены идут")
@@ -1015,6 +1093,87 @@ async def rtds_price_loop(eng: Engine, stop: asyncio.Event):
         backoff = min(backoff * 2, 30)
 
 
+CB_PRODUCT = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
+OKX_INST = {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT", "SOLUSDT": "SOL-USDT", "XRPUSDT": "XRP-USDT"}
+
+
+def parse_coinbase(msg: dict):
+    if isinstance(msg, dict) and msg.get("type") == "ticker" and msg.get("price"):
+        inv = {v: k for k, v in CB_PRODUCT.items()}
+        sym = inv.get(msg.get("product_id"))
+        if sym:
+            return [(sym, float(msg["price"]))]
+    return []
+
+
+def parse_okx(msg: dict):
+    out = []
+    if isinstance(msg, dict) and (msg.get("arg") or {}).get("channel") == "tickers":
+        inv = {v: k for k, v in OKX_INST.items()}
+        for d in msg.get("data") or []:
+            sym = inv.get(d.get("instId"))
+            if sym and d.get("last"):
+                out.append((sym, float(d["last"])))
+    return out
+
+
+async def generic_price_ws(eng: Engine, stop: asyncio.Event, name: str, url: str, sub: str,
+                           parser, ping_text: str | None, ping_every: float):
+    backoff = 1
+    while not stop.is_set():
+        ws, pinger = None, None
+        try:
+            ws = await WebSocket.connect(url)
+            await ws.send(sub)
+            backoff = 1
+            if ping_text:
+                async def ping():
+                    while True:
+                        await asyncio.sleep(ping_every)
+                        await ws.send(ping_text)
+                pinger = asyncio.ensure_future(ping())
+            while not stop.is_set():
+                raw = await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"])
+                if raw in ("pong", "PONG"):
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                for sym, px in parser(msg):
+                    eng.prices.add(sym, eng.api.now(), px, name)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            key = f"{name}_reconnect"
+            eng.count(key)
+            n = eng.counters[key]
+            m = f"{name}: обрыв #{n}: {type(e).__name__}: {e}"
+            (eng.info if n in (1, 2, 3, 10) or n % 50 == 0 else log.debug)(m)
+        finally:
+            if pinger:
+                pinger.cancel()
+            if ws:
+                await ws.close()
+        try:
+            await asyncio.wait_for(stop.wait(), backoff)
+        except asyncio.TimeoutError:
+            pass
+        backoff = min(backoff * 2, 30)
+
+
+def coinbase_loop(eng: Engine, stop: asyncio.Event):
+    prods = [CB_PRODUCT[s] for s in eng.cfg["assets"].values() if s in CB_PRODUCT]
+    sub = json.dumps({"type": "subscribe", "product_ids": prods, "channels": ["ticker"]})
+    return generic_price_ws(eng, stop, "coinbase_ws", eng.cfg["coinbase_ws"], sub, parse_coinbase, None, 0)
+
+
+def okx_loop(eng: Engine, stop: asyncio.Event):
+    args = [{"channel": "tickers", "instId": OKX_INST[s]} for s in eng.cfg["assets"].values() if s in OKX_INST]
+    sub = json.dumps({"op": "subscribe", "args": args})
+    return generic_price_ws(eng, stop, "okx_ws", eng.cfg["okx_ws"], sub, parse_okx, "ping", 20)
+
+
 async def binance_rest_loop(eng: Engine, stop: asyncio.Event):
     """Запасной вариант: опрос REST раз в секунду, если потоки молчат."""
     syms = list(eng.cfg["assets"].values())
@@ -1025,8 +1184,7 @@ async def binance_rest_loop(eng: Engine, stop: asyncio.Event):
                 px = await eng.api.get_prices(syms)
                 now = eng.api.now()
                 for s, p in px.items():
-                    eng.prices.add(s, now, p)
-                eng.prices.source = "rest"
+                    eng.prices.add(s, now, p, "binance_rest")
                 errors = 0
             except Exception as e:  # noqa: BLE001
                 errors += 1
@@ -1084,6 +1242,10 @@ async def run(cfg: dict, out: Path):
         loops.append(binance_ws_loop(eng, stop))
     if cfg["use_rtds_prices"]:
         loops.append(rtds_price_loop(eng, stop))
+    if cfg["use_coinbase_ws"]:
+        loops.append(coinbase_loop(eng, stop))
+    if cfg["use_okx_ws"]:
+        loops.append(okx_loop(eng, stop))
     if cfg["use_clob_ws"]:
         loops.append(clob_ws_loop(eng, stop))
     tasks = [asyncio.ensure_future(x) for x in loops]
@@ -1132,7 +1294,8 @@ def report(out: Path) -> str:
             L.append(f"  итого: {sum(x['pnl'] for x in xs):+.2f}$")
         L.append("")
     L.append(f"Котировок выставлено: {c.get('pairs_created', 0)}, переставлено {c.get('requoted', 0)}, "
-             f"снято на рывке {c.get('canceled_on_move', 0)} (рывков {c.get('moves', 0)}), "
+             f"снято на рывке биржи {c.get('canceled_on_move', 0)} (рывков {c.get('moves', 0)}), "
+             f"на рывке стакана {c.get('canceled_on_book_move', 0)} (рывков {c.get('book_moves', 0)}), "
              f"догоняли {c.get('chased', 0)}")
     skips = {k[5:]: v for k, v in c.items() if k.startswith("skip_")}
     if skips:
@@ -1215,7 +1378,8 @@ async def diag(cfg: dict, seconds: int = 60):
             toks += [str(t) for t in _as_list(m.get("clobTokenIds"))]
     syms = list(cfg["assets"].values())
     burl = cfg["binance_ws"] + "?streams=" + "/".join(f"{x.lower()}@aggTrade" for x in syms)
-    buckets = {"binance_ws": [0] * (seconds // 10), "rtds_prices": [0] * (seconds // 10),
+    buckets = {"binance_ws": [0] * (seconds // 10), "coinbase_ws": [0] * (seconds // 10),
+               "okx_ws": [0] * (seconds // 10), "rtds_prices": [0] * (seconds // 10),
                "clob_ws": [0] * (seconds // 10), "clob_trades": [0] * (seconds // 10)}
     t0 = time.time()
     errors = []
@@ -1260,14 +1424,20 @@ async def diag(cfg: dict, seconds: int = 60):
     wanted = {v: k for k, v in RTDS_SYMBOL.items()}
     rsub = json.dumps({"action": "subscribe", "subscriptions": [
         {"topic": "crypto_prices", "type": "update", "filters": wanted[x]} for x in syms if x in wanted]})
+    cb_sub = json.dumps({"type": "subscribe", "channels": ["ticker"],
+                         "product_ids": [CB_PRODUCT[x] for x in syms if x in CB_PRODUCT]})
+    okx_sub = json.dumps({"op": "subscribe",
+                          "args": [{"channel": "tickers", "instId": OKX_INST[x]} for x in syms if x in OKX_INST]})
     res = await asyncio.gather(
         reader("binance_ws", burl, None),
+        reader("coinbase_ws", cfg["coinbase_ws"], cb_sub),
+        reader("okx_ws", cfg["okx_ws"], okx_sub),
         reader("rtds_prices", cfg["rtds_url"], rsub),
         reader("clob_ws", cfg["clob_ws"], json.dumps({"assets_ids": toks, "type": "market"}) if toks else None),
         rest())
     for k, v in buckets.items():
         print(f"  {k:<12} {v}")
-    print(f"  binance REST, мс: {res[3]}")
+    print(f"  binance REST, мс: {res[5]}")
     for e in errors:
         print(f"  ОШИБКА {e}")
     frozen = [k for k, v in buckets.items() if k != "clob_trades" and v and v[0] > 0 and 0 in v[1:]]
