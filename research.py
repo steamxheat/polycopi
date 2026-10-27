@@ -36,6 +36,8 @@ HERE = Path(__file__).resolve().parent
 DATA = "https://data-api.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 BINANCE = "https://data-api.binance.vision"
+BINANCE_MIRRORS = ["https://data-api.binance.vision", "https://api.binance.com", "https://api1.binance.com",
+                   "https://api2.binance.com", "https://api3.binance.com", "https://api4.binance.com"]
 SLUG_RE = re.compile(r"^(btc|eth|sol|xrp)-updown-(5m|15m|1h|4h)-(\d{9,11})$")
 DUR = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
 SYMBOL = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT", "xrp": "XRPUSDT"}
@@ -60,10 +62,15 @@ def p_up(s: float, s0: float, sigma_1s: float, tau: float) -> float:
 class Klines:
     """Посекундные цены закрытия из Binance (кэш по символу)."""
 
+    CHUNK = 300          # секунд за запрос: большие ответы с сервера в РФ обрываются
+
     def __init__(self, http: Http, base: str = BINANCE):
-        self.http, self.base = http, base
+        self.http = http
+        # запасные адреса Binance: если один «залипает», пробуем следующий
+        self.bases = [base] + [b for b in BINANCE_MIRRORS if b != base]
         self.close: dict[str, dict[int, float]] = defaultdict(dict)
         self.requests = 0
+        self.failed = 0
         self._logs: dict[str, dict[int, float]] = {}
 
     def funcs(self, symbol: str):
@@ -73,15 +80,36 @@ class Klines:
             self._logs[symbol] = d
         return fvmodel.series_funcs(d)
 
-    async def load(self, symbol: str, start: int, end: int):
+    async def _get(self, symbol: str, t: int):
+        for attempt in range(len(self.bases) * 2):
+            base = self.bases[0]
+            try:
+                self.requests += 1
+                return await self.http.aget(f"{base}/api/v3/klines",
+                                            {"symbol": symbol, "interval": "1s",
+                                             "startTime": t * 1000, "limit": self.CHUNK})
+            except Exception as e:  # noqa: BLE001
+                self.bases.append(self.bases.pop(0))      # следующий адрес
+                await asyncio.sleep(min(2 * (attempt + 1), 10))
+                if attempt in (0, 3):
+                    print(f"    Binance {base}: {str(e)[-50:]} -> пробую {self.bases[0]}", flush=True)
+        return None
+
+    async def load(self, symbol: str, start: int, end: int, progress: bool = True):
         t = start
+        t0, total = time.time(), max(end - start, 1)
+        last_print = 0.0
         while t < end:
-            rows = await aget_retry(self.http, f"{self.base}/api/v3/klines",
-                                        {"symbol": symbol, "interval": "1s",
-                                         "startTime": t * 1000, "limit": 1000})
-            self.requests += 1
+            rows = await self._get(symbol, t)
+            if progress and time.time() - last_print > 30:
+                last_print = time.time()
+                print(f"    свечи: {(t - start) / total:.0%} ({time.time() - t0:.0f} с)", flush=True)
+            if rows is None:                       # не удалось — пропускаем кусок, не падаем
+                self.failed += 1
+                t += self.CHUNK
+                continue
             if not rows:
-                t += 1000
+                t += self.CHUNK
                 continue
             for r in rows:
                 self.close[symbol][int(r[0]) // 1000] = float(r[4])
@@ -240,7 +268,7 @@ async def collect(http: Http, wallet: str, max_trades: int, base_data: str) -> l
 async def run(args) -> int:
     http = Http(timeout=15)
     wallets = {args.name: args.wallet.lower()} if args.wallet else DEFAULT_WALLETS
-    kl = Klines(http, args.binance)
+    kl = Klines(Http(timeout=20, keepalive=False), args.binance)
     winners: dict[str, str | None] = {}
     report = []
     dataset = []
@@ -356,7 +384,7 @@ async def run(args) -> int:
         for r in dataset:
             f.write(json.dumps(r) + "\n")
     print(f"\nОтчёт: research_report.txt, все сделки с признаками: research_trades.jsonl "
-          f"(запросов к Binance: {kl.requests})")
+          f"(запросов к Binance: {kl.requests}, не загрузилось кусков: {kl.failed})")
     return 0
 
 

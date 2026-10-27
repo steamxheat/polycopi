@@ -288,3 +288,33 @@ class ResearchTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KlinesFailTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dead_host_rotates_and_failure_is_skipped(self):
+        calls = []
+
+        class H:
+            async def aget(self, url, params=None):
+                calls.append(url)
+                if "data-api" in url:
+                    raise TimeoutError("read timed out")
+                t0 = params["startTime"] // 1000
+                if t0 >= 1200:
+                    raise TimeoutError("all dead here")
+                return [[(t0 + i) * 1000, 0, 0, 0, "100"] for i in range(params["limit"])]
+
+        orig = research.asyncio.sleep
+
+        async def nosleep(_):
+            await orig(0)
+        research.asyncio.sleep = nosleep
+        try:
+            kl = research.Klines(H())
+            await kl.load("BTCUSDT", 0, 1500, progress=False)
+        finally:
+            research.asyncio.sleep = orig
+        self.assertIn(0, kl.close["BTCUSDT"])
+        self.assertIn(1199, kl.close["BTCUSDT"])
+        self.assertEqual(kl.failed, 1)                   # кусок 1200-1500 пропущен, но без падения
+        self.assertTrue(any("api.binance.com" in c for c in calls))
