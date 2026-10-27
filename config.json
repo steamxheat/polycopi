@@ -1,0 +1,18 @@
+{
+  "leaders": {
+    "goodfallen": "0x0ca4e9d27ff826a109ecbf74754fb66b93f277a6",
+    "almach": "0x3725d52f3c252e8374999cc8617292ea2608ad88"
+  },
+  "start_cash": 100,
+  "usd_per_trade": 2,
+  "max_usd_per_trade": 5,
+  "max_slippage": 0.02,
+  "max_entry_price": 0.97,
+  "min_seconds_left": 10,
+  "group_window_s": 3,
+  "taker_fee_coef": 0.07,
+  "use_rtds": true,
+  "use_polling": true,
+  "poll_interval_s": 1.5,
+  "status_every_s": 60
+}
