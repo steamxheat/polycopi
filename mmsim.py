@@ -60,8 +60,9 @@ DEFAULTS = {
     "requote_ticks": 2,             # переставить, если справедливая цена ушла на N тиков
     "move_window_s": 3,             # окно для детекции резкого движения
     "move_threshold_bps": 5,        # 5 б.п. = 0.05% за move_window_s
-    "book_move_ticks": 3,           # рывок по стакану Polymarket: середина Up сдвинулась на N тиков
+    "book_move_ticks": 4,           # рывок по стакану Polymarket: середина Up сдвинулась на N тиков
     "book_move_window_s": 2,
+    "book_cooldown_s": 3,           # пауза после рывка стакана (короче, чем после рывка биржи)
     "cooldown_after_move_s": 10,
     "chase_enabled": False,         # догонять вторую ногу, если первая исполнилась
     "chase_after_s": 30,
@@ -629,7 +630,7 @@ class Engine:
         now = self.api.now()
         if now < self.book_cooldown.get(mk.slug, 0):
             return
-        self.book_cooldown[mk.slug] = now + self.cfg["cooldown_after_move_s"]
+        self.book_cooldown[mk.slug] = now + self.cfg["book_cooldown_s"]
         n = 0
         for p, ou, od in list(self.market_orders(mk)):
             if p.state == "quoting" and ou.filled == 0 and od.filled == 0 and ou.canceled_ts is None:
@@ -638,7 +639,7 @@ class Engine:
                 p.state, p.close_reason = "canceled", "book_move"
                 mk.pairs.remove(p.id)
                 n += 1
-        self.cooldown[mk.asset] = max(self.cooldown.get(mk.asset, 0), now + self.cfg["cooldown_after_move_s"])
+        self.cooldown[mk.asset] = max(self.cooldown.get(mk.asset, 0), now + self.cfg["book_cooldown_s"])
         self.count("book_moves")
         if n:
             self.count("canceled_on_book_move", n)

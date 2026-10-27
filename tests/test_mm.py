@@ -547,7 +547,7 @@ class BookMoveTests(unittest.IsolatedAsyncioTestCase):
             e.on_book_event({"event_type": "price_change", "price_changes": [
                 {"asset_id": UP, "best_bid": "0.49", "best_ask": "0.51"}]}, toks)
             api.t += 1
-            # Down: bid .45/.47 -> Up эквивалент 0.54, сдвиг 4¢ >= 3 тиков
+            # Down: bid .45/.47 -> Up эквивалент 0.54, сдвиг 4¢ >= 4 тиков
             e.on_book_event({"event_type": "price_change", "price_changes": [
                 {"asset_id": DN, "best_bid": "0.45", "best_ask": "0.47"}]}, toks)
             self.assertEqual(p.state, "canceled")
