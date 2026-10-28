@@ -217,6 +217,23 @@ class MMTests(unittest.IsolatedAsyncioTestCase):
         txt = report(self.tmp)
         self.assertIn("одна нога: 1 (100%)", txt)
         self.assertIn("ГЛАВНОЕ ЧИСЛО", txt)
+        # «фото рынка» записано при котировке и при исполнении, разбор работает
+        rec = json.loads((self.tmp / "features.jsonl").read_text().splitlines()[0])
+        self.assertEqual(rec["outcome"], "one_leg_loss")
+        self.assertIn("sec", rec["q"])
+        self.assertEqual(rec["f"]["leg"], "Up")
+        self.assertIn("u_bid", rec["q"])
+        txt = mmsim.learn_report([self.tmp])
+        self.assertIn("одиноких ног 1", txt)
+        self.assertIn("По монетам", txt)
+
+    async def test_feature_state_roundtrip(self):
+        e = self.eng()
+        await e.step()
+        e.save()
+        e2 = self.eng()
+        pid = e.markets[SLUG].pairs[0]
+        self.assertIn("q", e2.pairs[pid].feat)
 
     async def test_move_cancels_unfilled_but_keeps_hedge_leg(self):
         e = self.eng()

@@ -186,6 +186,7 @@ class Pair:
     chased: bool = False
     pnl: float | None = None
     outcome: str = ""        # complete | one_leg_win | one_leg_loss | no_fill | partial
+    feat: dict = field(default_factory=dict)   # «фото рынка»: q — при котировке, f — при первом исполнении
 
 
 @dataclass
@@ -291,6 +292,21 @@ class PriceFeed:
                 best = h[-1]
         return best[1] if best else None
 
+    def ret_bps(self, symbol: str, now: float, window_s: float, fresh_s: float = 3.0):
+        """Изменение цены за последние window_s секунд, б.п. (медиана по источникам; + = рост)."""
+        vals = []
+        for (sym, _), h in self.hist.items():
+            if sym != symbol or not h or now - h[-1][0] > fresh_s:
+                continue
+            past = None
+            for ts, px in reversed(h):
+                if ts <= now - window_s:
+                    past = px
+                    break
+            if past:
+                vals.append((h[-1][1] / past - 1) * 1e4)
+        return round(statistics.median(vals), 2) if vals else None
+
     def move_bps(self, symbol: str, now: float, window_s: float) -> float:
         """Максимальное отклонение последней цены от любой цены за окно, в б.п."""
         mx = 0.0
@@ -393,6 +409,8 @@ class Engine:
         self.done_pairs: list[dict] = []      # итоги рассчитанных пар (для отчёта)
         self.sampler = fvmodel.Sampler(self.prices)
         self.s0: dict[str, dict] = {}         # slug -> {источник: цена на старте окна}
+        self.tob: dict[str, tuple] = {}       # токен -> (лучший бид, лучший аск, время) из ленты CLOB
+        self.flow: dict[str, deque] = {}      # slug -> (время, токен, объём) сделок рынка
         self._load()
 
     # ------------------------------------------------------------ io
@@ -516,6 +534,49 @@ class Engine:
         return fvmodel.market_prob(self.sampler, self.prices, sym, mk.start_ts, mk.end_ts, s0, now,
                                    self.cfg["rule"], self.cfg["sigma_window_s"], self.cfg["sigma_floor"])
 
+    def snapshot(self, mk: Market, books: dict | None = None) -> dict:
+        """«Фото рынка» для разбора, какие условия приводят к проигрышной одной ноге."""
+        now = self.api.now()
+        sym = self.cfg["assets"][mk.asset]
+        f = {"t": round(now, 2), "sec": round(now - mk.start_ts, 1), "left": round(mk.end_ts - now, 1)}
+        for k in (1, 2, 5, 10, 30):
+            f[f"r{k}"] = self.prices.ret_bps(sym, now, k)
+        try:
+            sig = self.sampler.sigma(sym, now, self.cfg["sigma_window_s"])
+            f["sig_bps"] = round(sig * 1e4, 3) if sig else None
+        except Exception:  # noqa: BLE001
+            f["sig_bps"] = None
+        try:
+            m = self.model_fair(mk)
+            f["model"] = round(m, 4) if m is not None else None
+        except Exception:  # noqa: BLE001
+            f["model"] = None
+        for leg, tok in (("u", mk.up_token), ("d", mk.down_token)):
+            b = (books or {}).get(tok)
+            if b is not None:
+                bb, bsz, _ = best(b, "bids")
+                ba, asz, _ = best(b, "asks")
+                f[f"{leg}_bid"], f[f"{leg}_ask"], f[f"{leg}_bsz"], f[f"{leg}_asz"] = bb, ba, bsz, asz
+            elif tok in self.tob:
+                bb, ba, ts = self.tob[tok]
+                f[f"{leg}_bid"], f[f"{leg}_ask"], f[f"{leg}_tob_age"] = bb, ba, round(now - ts, 2)
+        h = self.book_hist.get(mk.slug)
+        if h:
+            f["mid"] = round(h[-1][1], 4)
+            f["mid_chg"] = round(h[-1][1] - h[0][1], 4)
+        fl = self.flow.get(mk.slug)
+        if fl:
+            for k in (5, 30):
+                f[f"vol_u{k}"] = round(sum(sz for ts, tok, sz in fl if tok == mk.up_token and ts >= now - k), 1)
+                f[f"vol_d{k}"] = round(sum(sz for ts, tok, sz in fl if tok == mk.down_token and ts >= now - k), 1)
+        return f
+
+    def _write_features(self, row: dict, p: Pair):
+        rec = dict(row)
+        rec.update(p.feat)
+        with (self.out / "features.jsonl").open("a") as fh:
+            fh.write(json.dumps(rec, separators=(",", ":")) + "\n")
+
     async def quote(self, mk: Market):
         cfg, now = self.cfg, self.api.now()
         if now < mk.start_ts + cfg["start_after_s"] or now > mk.end_ts - cfg["stop_new_pairs_before_end_s"]:
@@ -580,6 +641,10 @@ class Engine:
             self.count("skip_no_cash")
             return
         p = Pair(pid, mk.slug, mk.asset, now, ou.id, od.id, round(fair, 4))
+        try:
+            p.feat["q"] = self.snapshot(mk, {mk.up_token: bu, mk.down_token: bd})
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"snapshot: {e}")
         self.pairs[pid] = p
         mk.pairs.append(pid)
         self.count("pairs_created")
@@ -683,6 +748,7 @@ class Engine:
                 continue
             if bb <= 0 or ba <= 0 or ba < bb:
                 continue
+            self.tob[tok] = (bb, ba, now)
             mid = (bb + ba) / 2
             if tok == mk.down_token:
                 mid = 1 - mid                       # приводим к цене Up
@@ -761,6 +827,10 @@ class Engine:
             return
         seen.add(key)
         mk.trades_seen += 1
+        fl = self.flow.setdefault(mk.slug, deque())
+        fl.append((ts, token, size))
+        while fl and fl[0][0] < ts - 60:
+            fl.popleft()
         self.count(f"trades_{source}")
         if ts >= self.run_started:
             self.trade_lag[source].append(self.api.now() - ts)
@@ -820,6 +890,12 @@ class Engine:
                 self.info(f"ПАРА ✔ #{p.id} {mk.asset.upper()} Up {ou.price:.2f} + Down {od.price:.2f} "
                           f"= {ou.price + od.price:.2f} → зафиксировано +${locked:.2f}{late}")
         elif p.state == "quoting":
+            try:
+                p.feat["f"] = self.snapshot(mk)
+                p.feat["f"]["leg"] = o.leg
+                p.feat["f"]["fill_lag"] = round(self.api.now() - ts, 2)
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"snapshot: {e}")
             p.state = "one_leg"
             self.count("first_legs")
             sec_left = mk.end_ts - self.api.now()
@@ -901,6 +977,11 @@ class Engine:
                    "second_fill_s": round(max(ffs) - p.created_ts, 1) if len(ffs) == 2 else "",
                    "chased": p.chased}
             rows.append(row)
+            if outcome != "no_fill" or p.feat:
+                try:
+                    self._write_features(row, p)
+                except OSError as e:
+                    log.debug(f"features: {e}")
             self.done_pairs.append({"pair_id": p.id, "asset": p.asset, "outcome": outcome,
                                     "pnl": round(pnl, 6), "t": now,
                                     "pair_cost": round(ou.price + od.price, 4)})
@@ -918,6 +999,9 @@ class Engine:
         for oid in [k for k, o in self.orders.items() if o.slug == mk.slug]:
             self.orders.pop(oid)
         self.trade_seen.pop(mk.slug, None)
+        self.flow.pop(mk.slug, None)
+        for tok in (mk.up_token, mk.down_token):
+            self.tob.pop(tok, None)
 
     def _write_pairs(self, rows):
         if not rows:
@@ -1572,17 +1656,131 @@ async def diag(cfg: dict, seconds: int = 60):
           "на стороне сервера" if frozen else "потоки идут без замираний")
 
 
+# ======================================================================= learn
+
+def _load_features(outs: list[Path]) -> list[dict]:
+    rows = []
+    for o in outs:
+        path = o / "features.jsonl"
+        if not path.exists():
+            continue
+        for line in path.open():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _bucket_table(title: str, items: list[tuple], edges: list[float], fmt: str = "{:+g}") -> list[str]:
+    """items: (значение, выиграла_ли_нога, pnl). Таблица по корзинам значения."""
+    L = [f"  {title}:"]
+    xs = [it for it in items if it[0] is not None]
+    if not xs:
+        return L + ["    (нет данных)"]
+    bounds = [-math.inf] + edges + [math.inf]
+    for lo, hi in zip(bounds, bounds[1:]):
+        b = [it for it in xs if lo <= it[0] < hi]
+        if not b:
+            continue
+        w = sum(1 for it in b if it[1])
+        pnl = sum(it[2] for it in b)
+        name = (f"< {fmt.format(hi)}" if lo == -math.inf else
+                f">= {fmt.format(lo)}" if hi == math.inf else f"{fmt.format(lo)}..{fmt.format(hi)}")
+        L.append(f"    {name:<16} ног {len(b):4d} | выигр. {w / len(b) * 100:3.0f}% | PnL {pnl:+8.2f}$")
+    return L
+
+
+def learn_report(outs: list[Path]) -> str:
+    """Разбор одиноких ног: при каких условиях рынка они проигрывают."""
+    rows = _load_features(outs)
+    if not rows:
+        return "Нет features.jsonl — данные появятся после первых рассчитанных рынков с новой версией."
+    legs = [r for r in rows if "one_leg" in r.get("outcome", "") and isinstance(r.get("f"), dict)]
+    comp = [r for r in rows if r.get("outcome") == "complete"]
+    nof = [r for r in rows if r.get("outcome") == "no_fill"]
+    L = [f"=== Разбор рынка: пар {len(rows)}, полных {len(comp)}, одиноких ног {len(legs)}, "
+         f"без исполнения {len(nof)} ==="]
+    if not legs:
+        return "\n".join(L + ["Одиноких ног с данными пока нет."])
+    w = sum(1 for r in legs if "win" in r["outcome"])
+    L.append(f"Одинокие ноги: выиграли {w} из {len(legs)} ({w / len(legs) * 100:.0f}%), "
+             f"PnL {sum(r['pnl'] for r in legs):+.2f}$")
+    L.append("«За ногу» = цена на бирже шла в сторону исполненной ноги (Up и рост, Down и падение).")
+
+    def it(key, src="f", orient=True):
+        out = []
+        for r in legs:
+            f = r.get(src) or {}
+            v = f.get(key)
+            if v is not None and orient:
+                leg = (r.get("f") or {}).get("leg", "Up")
+                v = v if leg == "Up" else -v
+            out.append((v, "win" in r["outcome"], r["pnl"]))
+        return out
+
+    L.append("")
+    L.append("1) Движение биржи в момент исполнения (б.п., «+» = за ногу, «−» = против):")
+    for k in (2, 5, 30):
+        L += _bucket_table(f"за {k}с до исполнения", it(f"r{k}"), [-3, -1, 0, 1, 3])
+    L.append("")
+    L.append("2) Движение биржи в момент котировки:")
+    for k in (5, 30):
+        L += _bucket_table(f"за {k}с до котировки", it(f"r{k}", "q"), [-3, -1, 0, 1, 3])
+    L.append("")
+    L.append("3) Модель против стакана при исполнении (модель P(нога) − цена ноги):")
+    edge = []
+    for r in legs:
+        f = r.get("f") or {}
+        m, leg = f.get("model"), f.get("leg", "Up")
+        price = r["up_price"] if leg == "Up" else r["down_price"]
+        if m is not None:
+            pm = m if leg == "Up" else 1 - m
+            edge.append((pm - price, "win" in r["outcome"], r["pnl"]))
+        else:
+            edge.append((None, False, 0))
+    L += _bucket_table("модель − цена", edge, [-0.1, -0.03, 0, 0.03, 0.1])
+    L.append("")
+    L.append("4) Когда в окне случилось исполнение:")
+    L += _bucket_table("секунда окна", it("sec", orient=False), [60, 120, 180, 240], "{:g}")
+    L.append("")
+    L.append("5) Волатильность (σ за секунду, б.п.):")
+    L += _bucket_table("σ", it("sig_bps", "q", orient=False), [0.5, 1, 1.5, 2.5], "{:g}")
+    L.append("")
+    L.append("6) Цена исполненной ноги:")
+    pr = []
+    for r in legs:
+        leg = (r.get("f") or {}).get("leg", "Up")
+        pr.append((r["up_price"] if leg == "Up" else r["down_price"], "win" in r["outcome"], r["pnl"]))
+    L += _bucket_table("цена", pr, [0.3, 0.4, 0.5, 0.6], "{:g}")
+    L.append("")
+    L.append("7) По монетам:")
+    for a in sorted({r["asset"] for r in legs}):
+        b = [r for r in legs if r["asset"] == a]
+        ww = sum(1 for r in b if "win" in r["outcome"])
+        cc = [r for r in comp if r["asset"] == a]
+        L.append(f"    {a.upper():<5} ног {len(b):4d} | выигр. {ww / len(b) * 100:3.0f}% | PnL ног "
+                 f"{sum(r['pnl'] for r in b):+8.2f}$ | полных пар {len(cc)} (+{sum(r['pnl'] for r in cc):.2f}$)")
+    if len(legs) < 200:
+        L.append("")
+        L.append(f"⚠️ Ног пока {len(legs)} — выводы ненадёжны, нужно хотя бы 200–300.")
+    return "\n".join(L)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Симулятор маркет-мейкера Polymarket 5m BTC/ETH")
-    ap.add_argument("cmd", choices=["run", "report", "check", "diag"])
+    ap.add_argument("cmd", choices=["run", "report", "check", "diag", "learn"])
     ap.add_argument("--config", default=str(HERE / "mm_config.json"))
-    ap.add_argument("--out", default=str(HERE / "data_mm"))
+    ap.add_argument("--out", default=str(HERE / "data_mm"),
+                    help="папка данных; для learn можно несколько через запятую")
     a = ap.parse_args()
     cfg = load_config(Path(a.config))
     if a.cmd == "run":
         asyncio.run(run(cfg, Path(a.out)))
     elif a.cmd == "report":
         print(report(Path(a.out)))
+    elif a.cmd == "learn":
+        print(learn_report([Path(x) for x in a.out.split(",")]))
     elif a.cmd == "diag":
         asyncio.run(diag(cfg))
     else:
