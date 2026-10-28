@@ -53,6 +53,7 @@ DEFAULTS = {
     "min_price": 0.05,
     "max_price": 0.95,
     "signal_gap_s": 5.0,        # не брать один и тот же токен чаще, чем раз в N с
+    "fill_tolerance": 0.01,     # бот готов взять до «увиденная цена + 1¢» — как в fvsim
     "rest_every_s": 2.0,        # как часто сверять REST с живой лентой
     "loop_s": 0.02,
     "trigger_gap_s": 0.01,      # не чаще раза в 10 мс (цены приходят пачками)
@@ -76,7 +77,7 @@ DEFAULTS = {
 
 LEVEL_COLS = ["time_utc", "asset", "window", "tok", "price", "life_ms", "move_bps", "after_move"]
 SURV_COLS = ["time_utc", "asset", "window", "tok", "side", "ask0", "move_bps", "ask_age_s"] + \
-            [f"ok_{t}" for t in HORIZONS_MS]
+            [f"ok_{t}" for t in HORIZONS_MS] + [f"okt_{t}" for t in HORIZONS_MS]
 GHOST_COLS = ["time_utc", "asset", "tok", "rest_ask", "ws_ask", "diff_c",
               "rest_age_ms", "call_ms", "ghost"]
 
@@ -221,7 +222,7 @@ class Watcher:
                     continue
                 self.last_signal[tok] = now
                 self.pending.append({"tok": tok, "ask0": a, "t0": now, "mv": mv, "age": age,
-                                     "mk": mk, "side": side, "ok": {}})
+                                     "mk": mk, "side": side, "ok": {}, "okt": {}})
                 self.count("signals")
 
     def resolve_pending(self):
@@ -229,25 +230,30 @@ class Watcher:
         while self.pending and (now - self.pending[0]["t0"]) * 1000 >= HORIZONS_MS[-1]:
             p = self.pending.popleft()
             self._finish(p, now)
+        tol = self.cfg["fill_tolerance"]
         for p in self.pending:
             el = (now - p["t0"]) * 1000
             for t in HORIZONS_MS:
                 if t not in p["ok"] and el >= t:
                     a = self.book.ask.get(p["tok"])
                     p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
+                    p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
 
     def _finish(self, p, now):
         el = (now - p["t0"]) * 1000
+        tol = self.cfg["fill_tolerance"]
         for t in HORIZONS_MS:
             if t not in p["ok"]:
                 a = self.book.ask.get(p["tok"]) if el >= t else None
                 p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
+                p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
         self.surv.append((p["ask0"], [p["ok"][t] for t in HORIZONS_MS]))
         row = {"time_utc": utc(p["t0"]), "asset": p["mk"].asset, "window": p["mk"].window,
                "tok": p["tok"][:12], "side": p["side"], "ask0": round(p["ask0"], 4),
                "move_bps": round(p["mv"], 2),
                "ask_age_s": round(p["age"], 2)}
         row.update({f"ok_{t}": p["ok"][t] for t in HORIZONS_MS})
+        row.update({f"okt_{t}": p["okt"][t] for t in HORIZONS_MS})
         self._csv("survive.csv", SURV_COLS, row)
 
     # ------------------------------------------------------ 3) призраки в REST
@@ -441,13 +447,17 @@ def report(out: Path) -> str:
     L += ["2) ГЛАВНОЕ: ВЫЖИВАЕТ ЛИ ЦЕНА, КОТОРУЮ МЫ ХОТИМ ЗАБРАТЬ",
           "   Момент, когда наш бот решил покупать. Через сколько мс цена ещё на месте?", ""]
     if sv:
-        L.append(f"{'задержка заявки':<22}{'успели':>9}{'из':>7}")
+        L.append(f"{'задержка заявки':<22}{'та же цена':>12}{'+1¢ допуск':>12}{'из':>7}")
         for t in HORIZONS_MS:
-            k = f"ok_{t}"
-            xs = [r[k] for r in sv if r.get(k) in ("0", "1")]
-            if xs:
-                L.append(f"{f'{t} мс':<22}{sum(x == '1' for x in xs) / len(xs):>8.0%}{len(xs):>7}")
-        L += ["", "   Это и есть наша доля исполнения при разной задержке.",
+            xs = [r for r in sv if r.get(f"ok_{t}") in ("0", "1")]
+            if not xs:
+                continue
+            a = sum(r[f"ok_{t}"] == "1" for r in xs) / len(xs)
+            yt = [r for r in xs if r.get(f"okt_{t}") in ("0", "1")]
+            b = f"{sum(r[f'okt_{t}'] == '1' for r in yt) / len(yt):.0%}" if yt else "-"
+            L.append(f"{f'{t} мс':<22}{a:>11.0%}{b:>12}{len(xs):>7}")
+        L += ["", "   «та же цена» — строго не хуже увиденной; «+1¢ допуск» — как реально",
+              "   покупает бот (он готов взять на цент дороже). Смотреть надо на вторую.",
               "   Ниже ~30% на нашей задержке — симулятор врёт в разы, стратегия не работает."]
         cheap = [r for r in sv if (f(r["ask0"]) or 1) <= 0.5]
         if cheap and len(cheap) >= 10:

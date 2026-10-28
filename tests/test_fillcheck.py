@@ -192,6 +192,32 @@ class SurvivalTests(unittest.TestCase):
         self.assertEqual(len(w.pending), 1)
         self.assertGreaterEqual(w.counters["fast_trigger"], 1)
 
+    def test_within_tolerance_counts_only_in_tol_column(self):
+        """Цена ушла на полцента: строго — мимо, но бот бы купил (допуск 1¢)."""
+        w, api, _ = self.arm(fill_tolerance=0.01)
+        w.check_signals()
+        api.t += 0.06
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.605", "size": "10"}]}, api.t)
+        for _ in range(30):
+            api.t += 0.05
+            w.resolve_pending()
+        r = fillcheck.rows(self.tmp / "survive.csv")[0]
+        self.assertEqual((r["ok_200"], r["okt_200"]), ("0", "1"))
+        self.assertEqual((r["ok_50"], r["okt_50"]), ("1", "1"))   # до сдвига успели
+
+    def test_beyond_tolerance_misses_both(self):
+        w, api, _ = self.arm(fill_tolerance=0.01)
+        w.check_signals()
+        api.t += 0.06
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.65", "size": "10"}]}, api.t)
+        for _ in range(30):
+            api.t += 0.05
+            w.resolve_pending()
+        r = fillcheck.rows(self.tmp / "survive.csv")[0]
+        self.assertEqual((r["ok_200"], r["okt_200"]), ("0", "0"))
+
     def test_signal_not_repeated_within_gap(self):
         w, api, _ = self.arm(signal_gap_s=5.0)
         w.check_signals()
