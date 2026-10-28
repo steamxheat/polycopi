@@ -16,7 +16,7 @@ def write(d: Path, trades, outcomes):
         w = csv.writer(fh)
         w.writerow(["slug", "winner"])
         w.writerows(outcomes)
-    cols = ["variant", "slug", "side", "shares", "fill_vwap", "edge_fill"]
+    cols = ["variant", "slug", "side", "shares", "fill_vwap", "edge_fill", "time_utc"]
     with (d / "trades.csv").open("w", newline="") as fh:
         w = csv.DictWriter(fh, cols)
         w.writeheader()
@@ -45,24 +45,44 @@ class SensTests(unittest.TestCase):
         self.assertNotIn(0.05, [t["edge"] for t in kept])
         self.assertEqual(sens.drop_best(ts, 0.0), ts)
 
+    def test_zscore_and_threshold(self):
+        self.assertEqual(sens.zscore([1.0] * 50), 99.0)       # разброса нет, плюс устойчив
+        self.assertEqual(sens.zscore([-1.0] * 50), 0.0)
+        self.assertAlmostEqual(sens.zscore([1, -1] * 50), 0.0)
+        self.assertGreater(sens.z_threshold(16), sens.z_threshold(1))   # перебор -> строже
+
+    def test_top_share_and_halves(self):
+        self.assertAlmostEqual(sens.top_share([10, 1, 1, 1, 1, 1], 3), 80.0)
+        self.assertEqual(sens.top_share([-1, -2], 3), 0.0)
+        ts = [{"shares": 10, "vwap": 0.5, "win": True, "edge": 0, "t": "2026-10-28T01:00:00"},
+              {"shares": 10, "vwap": 0.5, "win": False, "edge": 0, "t": "2026-10-28T02:00:00"}]
+        h1, h2, n1, n2 = sens.halves(ts)
+        self.assertEqual((n1, n2), (1, 1))
+        self.assertGreater(h1, 0)
+        self.assertLess(h2, 0)
+
     def test_load_skips_unsettled_and_report(self):
         outcomes = [[f"s{i}", "Up"] for i in range(40)] + [["sX", ""]]
         trades = [{"variant": "A", "slug": f"s{i}", "side": "Up", "shares": 10,
-                   "fill_vwap": 0.80, "edge_fill": 0.01 * (i % 5)} for i in range(40)]
+                   "fill_vwap": 0.80, "edge_fill": 0.01 * (i % 5),
+                   "time_utc": f"2026-10-28T{i // 2:02d}:00:00"} for i in range(40)]
         trades.append({"variant": "A", "slug": "sX", "side": "Up", "shares": 10,
-                       "fill_vwap": 0.80, "edge_fill": 0.9})     # окно не рассчитано
+                       "fill_vwap": 0.80, "edge_fill": 0.9,
+                       "time_utc": "2026-10-28T23:00:00"})       # окно не рассчитано
         write(self.d, trades, outcomes)
         self.assertEqual(len(sens.load(self.d)["A"]), 40)
         txt = sens.report(self.d, min_n=30)
         self.assertIn("A: 40 сделок", txt)
-        self.assertIn("ЗАПАС ЕСТЬ", txt)
+        self.assertIn("Прошли проверку на значимость: 1 из 1", txt)
+        self.assertNotIn("шум", txt)
 
     def test_losing_variant_marked(self):
         outcomes = [[f"s{i}", "Up" if i % 2 else "Down"] for i in range(40)]
         trades = [{"variant": "B", "slug": f"s{i}", "side": "Up", "shares": 10,
-                   "fill_vwap": 0.80, "edge_fill": 0.01} for i in range(40)]
+                   "fill_vwap": 0.80, "edge_fill": 0.01,
+                   "time_utc": f"2026-10-28T{i // 2:02d}:00:00"} for i in range(40)]
         write(self.d, trades, outcomes)
-        self.assertIn("НЕ ДЕРЖИТСЯ", sens.report(self.d, min_n=30))
+        self.assertIn("шум, не доказано", sens.report(self.d, min_n=30))
 
 
 if __name__ == "__main__":

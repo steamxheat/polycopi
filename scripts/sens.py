@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import statistics
 from pathlib import Path
 
 FEE_COEF = 0.07
@@ -42,7 +44,8 @@ def load(d: Path):
             try:
                 t = {"v": r["variant"], "shares": float(r["shares"]),
                      "vwap": float(r["fill_vwap"]), "win": r["side"] == w,
-                     "edge": float(r.get("edge_fill") or 0.0)}
+                     "edge": float(r.get("edge_fill") or 0.0),
+                     "t": r.get("time_utc") or ""}
             except (TypeError, ValueError):
                 continue
             trades.setdefault(t["v"], []).append(t)
@@ -64,6 +67,51 @@ def pnl(ts: list[dict], slip: float):
     return tot, roi, wins
 
 
+def each_pnl(ts: list[dict], slip: float = 0.0) -> list[float]:
+    out = []
+    for t in ts:
+        p = min(0.99, t["vwap"] + slip)
+        out.append((t["shares"] if t["win"] else 0.0) - (t["shares"] * p + fee(p, t["shares"])))
+    return out
+
+
+def zscore(xs: list[float]) -> float:
+    """Во сколько раз средний результат больше своей погрешности.
+    z около 0 — результат объясняется случайностью."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    sd = statistics.pstdev(xs)
+    m = statistics.mean(xs)
+    if sd <= 0:                      # все сделки одинаковы — разброса нет
+        return 99.0 if m > 0 else 0.0
+    return m / (sd / math.sqrt(n))
+
+
+def z_threshold(k: int) -> float:
+    """Порог z с поправкой на перебор k вариантов: при k вариантах самый удачливый
+    почти всегда даёт z около 2 просто так. Грубая, но честная поправка."""
+    k = max(1, k)
+    return 2.0 + 0.55 * math.log(k)
+
+
+def top_share(xs: list[float], m: int = 3) -> float:
+    """Какую долю всего плюса дают m самых крупных выигрышей.
+    Близко к 100% — плюс держится на нескольких случайных сделках."""
+    tot = sum(xs)
+    if tot <= 0:
+        return 0.0
+    return min(999.0, sum(sorted(xs, reverse=True)[:m]) / tot * 100)
+
+
+def halves(ts: list[dict]) -> tuple[float, float, int, int]:
+    """Делит сделки по времени на две половины: настоящее преимущество есть в обеих."""
+    s = sorted(ts, key=lambda t: t["t"])
+    half = len(s) // 2
+    a, b = each_pnl(s[:half]), each_pnl(s[half:])
+    return sum(a), sum(b), len(a), len(b)
+
+
 def drop_best(ts: list[dict], frac: float):
     """Убирает frac сделок с наибольшим перевесом — их заберут быстрые боты."""
     if frac <= 0:
@@ -76,16 +124,46 @@ def report(d: Path, min_n: int) -> str:
     trades = load(d)
     if not trades:
         return f"Нет рассчитанных сделок в {d}"
+    big = {v: ts for v, ts in trades.items() if len(ts) >= min_n}
+    thr = z_threshold(len(trades))
     slips = (0.0, 0.01, 0.02)
     drops = (0.0, 0.25, 0.50)
-    L = [f"=== Чувствительность: {d} ===",
-         "Строка — сколько сделок убрала конкуренция, столбец — насколько хуже цена.",
-         "В клетке: PnL $ / ROI %. Нужен плюс в клетке «−25% / +1 цент» и правее.", ""]
-    survivors = []
-    for v in sorted(trades):
-        ts = trades[v]
-        if len(ts) < min_n:
-            continue
+    L = [f"=== Чувствительность и значимость: {d} ===",
+         f"Вариантов всего {len(trades)}, из них с ≥{min_n} сделок — {len(big)}.",
+         "",
+         "ЧАСТЬ 1. Это вообще не случайность?",
+         "  z — во сколько раз средний результат больше своей погрешности.",
+         f"  Мы перебрали {len(trades)} вариантов, поэтому порог поднят до z ≥ {thr:.1f}:",
+         "  при таком переборе самый удачливый вариант даёт z около 2 просто по удаче.",
+         "  «топ-3» — какую долю плюса дают три самых крупных выигрыша.",
+         "  «половины» — результат первой и второй половины сделок по времени.",
+         "",
+         f"{'вариант':<20} {'сделок':>6} {'PnL $':>8} {'z':>6} {'топ-3':>7} "
+         f"{'1-я пол.':>10} {'2-я пол.':>10}  вывод"]
+    proven = []
+    for v in sorted(big):
+        ts = big[v]
+        xs = each_pnl(ts)
+        z = zscore(xs)
+        h1, h2, n1, n2 = halves(ts)
+        ok = z >= thr and h1 > 0 and h2 > 0
+        if ok:
+            proven.append(v)
+        L.append(f"{v:<20} {len(ts):>6} {sum(xs):>+8.1f} {z:>6.1f} {top_share(xs):>6.0f}% "
+                 f"{h1:>+10.1f} {h2:>+10.1f}  {'доказано' if ok else 'шум, не доказано'}")
+    L += ["", f"Прошли проверку на значимость: {len(proven)} из {len(big)}.", ""]
+    if not proven:
+        L += ["Ни один вариант не доказал преимущества. Плюс у лучших объясняется",
+              "тем, что вариантов много и сделок мало. Реальные деньги ставить нельзя —",
+              "нужно копить данные дальше и проверять на НОВЫХ окнах.", ""]
+    L += ["ЧАСТЬ 2. Что будет, если исполнение хуже.",
+          "  Строка — сколько сделок отобрала конкуренция (убираем лучшие по перевесу),",
+          "  столбец — насколько хуже цена исполнения. В клетке: PnL $ / ROI %.",
+          "  У настоящего преимущества числа падают ПЛАВНО сверху вниз.",
+          "  Если строка «−50%» лучше строки «−25%» — результат держится на случайных",
+          "  сделках, а не на правиле.", ""]
+    for v in sorted(big):
+        ts = big[v]
         base_pnl, base_roi, wins = pnl(ts, 0.0)
         L.append(f"--- {v}: {len(ts)} сделок, выигрышей {wins / len(ts) * 100:.0f}%, "
                  f"как есть {base_pnl:+.2f}$ ({base_roi:+.1f}%)")
@@ -102,21 +180,12 @@ def report(d: Path, min_n: int) -> str:
                 cells[(dr, s)] = p_
                 row += f"{f'{p_:+.1f}$ / {r_:+.1f}%':>16}"
             L.append(row)
-        key = cells.get((0.25, 0.01))
-        hard = cells.get((0.50, 0.02))
-        verdict = ("ЗАПАС ЕСТЬ" if key and key > 0 and hard and hard > 0 else
-                   "кромка: держится только при мягких допущениях" if key and key > 0 else
-                   "НЕ ДЕРЖИТСЯ")
-        L.append(f"  вывод: {verdict}")
+        a, b, c = cells.get((0.0, 0.0)), cells.get((0.25, 0.0)), cells.get((0.50, 0.0))
+        if None not in (a, b, c) and not (a >= b >= c):
+            L.append("  ! порядок нарушен: выбросили больше лучших — стало лучше. Это шум.")
         L.append("")
-        if key and key > 0:
-            survivors.append((v, key, len(ts)))
-    L.append(f"Пережили «−25% лучших + 1 цент»: {len(survivors)} вариантов "
-             f"(с ≥{min_n} сделок).")
-    for v, p_, n in sorted(survivors, key=lambda x: -x[1]):
-        L.append(f"  {v:<22} {p_:+.2f}$ на {n} сделках")
-    L += ["", "Важно: это всё ещё те же данные, на которых варианты выбирались.",
-          "Проверка на чувствительность не заменяет экзамен на НОВЫХ данных."]
+    L += ["Важно: это те же данные, на которых варианты и выбирались.",
+          "Ни значимость, ни чувствительность не заменяют экзамен на НОВЫХ окнах."]
     return "\n".join(L)
 
 
