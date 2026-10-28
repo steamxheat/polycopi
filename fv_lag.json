@@ -64,6 +64,34 @@
       "move_bps": 5,
       "move_s": 0.5,
       "ask_stale_s": 0.5
+    },
+    {
+      "name": "lagN3-1s",
+      "min_edge": 0.02,
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_not_up": true
+    },
+    {
+      "name": "lagN5-1s",
+      "min_edge": 0.02,
+      "move_bps": 5,
+      "move_s": 1,
+      "ask_not_up": true
+    },
+    {
+      "name": "lagN3-0.5s",
+      "min_edge": 0.02,
+      "move_bps": 3,
+      "move_s": 0.5,
+      "ask_not_up": true
+    },
+    {
+      "name": "lagN3-1s-any",
+      "min_edge": 0.0,
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_not_up": true
     }
   ],
   "use_binance_ws": false,

@@ -185,6 +185,7 @@ class Book:
         self.ask: dict[str, float] = {}
         self.t: dict[str, float] = {}
         self.ask_t: dict[str, float] = {}       # когда лучший аск последний раз менялся
+        self.ask_h: dict[str, deque] = {}       # история аска (время, цена) за последние секунды
 
     def on_event(self, ev: dict, now: float):
         et = ev.get("event_type")
@@ -212,7 +213,21 @@ class Book:
         if a is not None and 0 < a < 1:
             if self.ask.get(tok) != a:
                 self.ask_t[tok] = now
+                h = self.ask_h.setdefault(tok, deque())
+                h.append((now, a))
+                while h and now - h[0][0] > 10:
+                    h.popleft()
             self.ask[tok] = a
+
+    def ask_at(self, tok: str, t: float):
+        """Аск, который стоял в момент t (None, если не знаем)."""
+        best_ = None
+        for ts, a in self.ask_h.get(tok, ()):
+            if ts <= t:
+                best_ = a
+            else:
+                break
+        return best_
         self.t[tok] = now
 
 
@@ -468,8 +483,13 @@ class Engine:
                         sgn = 1 if side == "Up" else -1
                         if sum(1 for x in rets if sgn * x >= sp["move_bps"]) < cfg.get("lead_agree", 1):
                             continue
-                        if now - self.book.ask_t.get(tok, now) < sp.get("ask_stale_s", 0):
+                        if "ask_stale_s" in sp and now - self.book.ask_t.get(tok, now) < sp["ask_stale_s"]:
                             continue
+                        if sp.get("ask_not_up"):
+                            # Polymarket ещё не подорожал: аск сейчас не выше, чем до рывка
+                            before = self.book.ask_at(tok, now - sp.get("move_s", 1.0))
+                            if before is None or ask > before + 1e-9:
+                                continue
                     if not (sp.get("min_p", 0) <= p <= sp.get("max_p", 1)):
                         continue
                     if tau < sp.get("min_tau", 0) or tau > sp.get("max_tau", 1e9):

@@ -364,3 +364,13 @@ class StudyTests(unittest.TestCase):
 
     def test_min_p_filter(self):
         self.assertTrue(any(v.get("min_p") for v in fvsim.DEFAULTS["variants"]))
+
+
+class AskHistoryTests(unittest.TestCase):
+    def test_ask_at(self):
+        b = fvsim.Book()
+        b._set("T", 0.5, 0.52, 10.0)
+        b._set("T", 0.5, 0.55, 11.0)
+        self.assertEqual(b.ask_at("T", 10.5), 0.52)
+        self.assertEqual(b.ask_at("T", 11.5), 0.55)
+        self.assertIsNone(b.ask_at("T", 9.0))
