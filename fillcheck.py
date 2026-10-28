@@ -35,7 +35,7 @@ from pathlib import Path
 
 import fvsim
 import mmsim
-from core import _as_list
+from core import _as_list, walk_book
 from mmsim import Api, PriceFeed, best, utc
 
 log = mmsim.log            # тот же журнал, что у остальных ботов (polymm)
@@ -79,7 +79,9 @@ LEVEL_COLS = ["time_utc", "asset", "window", "tok", "price", "life_ms", "move_bp
 SURV_COLS = ["time_utc", "asset", "window", "tok", "side", "ask0", "move_bps", "ask_age_s"] + \
             [f"ok_{t}" for t in HORIZONS_MS] + [f"okt_{t}" for t in HORIZONS_MS]
 GHOST_COLS = ["time_utc", "asset", "tok", "rest_ask", "ws_ask", "diff_c",
-              "rest_age_ms", "call_ms", "ghost"]
+              "rest_age_ms", "call_ms", "ghost",
+              # сколько денег реально можно вложить в одну сделку (потолок по объёму)
+              "usd_at_best", "usd_within_1c", "usd_within_3c", "vwap_100usd"]
 
 
 def load_config(path: Path) -> dict:
@@ -277,11 +279,24 @@ class Watcher:
         ghost = ra < wa - 1e-9              # REST обещает дешевле, чем есть в живом стакане
         self.ghost_n += ghost
         mk = self.tok_mkt.get(tok)
+        cap = self.depth(bk, ra)
         self._csv("ghosts.csv", GHOST_COLS, {
             "time_utc": utc(self.api.now()), "asset": mk.asset if mk else "", "tok": tok[:12],
             "rest_ask": round(ra, 4), "ws_ask": round(wa, 4), "diff_c": round((wa - ra) * 100, 2),
             "rest_age_ms": round(age) if isinstance(age, float) else "",
-            "call_ms": round(call_ms), "ghost": int(ghost)})
+            "call_ms": round(call_ms), "ghost": int(ghost), **cap})
+
+    def depth(self, bk: dict, ask: float) -> dict:
+        """Потолок по объёму: сколько долларов можно взять по лучшей цене и около неё,
+        и во сколько обойдётся попытка вложить $100 (средняя цена поедет вверх)."""
+        out = {}
+        for name, lim in (("usd_at_best", ask), ("usd_within_1c", ask + 0.01),
+                          ("usd_within_3c", ask + 0.03)):
+            f = walk_book(bk, "BUY", 1e9, lim, 0.0)
+            out[name] = round(f.notional, 2)
+        f = walk_book(bk, "BUY", 100.0 / max(ask, 0.01), 1.0, 0.0)
+        out["vwap_100usd"] = round(f.vwap, 4) if f.shares > 0 else ""
+        return out
 
     # ------------------------------------------------------------------ рынки
     async def discover(self):
@@ -481,6 +496,29 @@ def report(out: Path) -> str:
                      f" смотри эту строку в таблице выше")
     else:
         L.append("   пока нет сверок")
+    # 4) потолок по объёму
+    L += ["", "4) ПОТОЛОК ПО ОБЪЁМУ: сколько денег влезает в одну сделку", ""]
+    caps = [(f(r.get("usd_at_best")), f(r.get("usd_within_1c")), f(r.get("usd_within_3c")),
+             f(r.get("vwap_100usd")), f(r.get("rest_ask"))) for r in gh]
+    caps = [c for c in caps if c[0] is not None]
+    if caps:
+        L.append(f"{'сколько доступно':<26}{'медиана':>10}{'25%':>9}{'10%':>9}")
+        for name, i in (("по лучшей цене", 0), ("в пределах +1¢", 1), ("в пределах +3¢", 2)):
+            xs = [c[i] for c in caps if c[i] is not None]
+            if xs:
+                L.append(f"{name:<26}{statistics.median(xs):>9.0f}${pct(xs, 25):>8.0f}$"
+                         f"{pct(xs, 10):>8.0f}$")
+        slips = [(v - a) * 100 for _, _, _, v, a in caps
+                 if v is not None and a is not None and v > 0]
+        if slips:
+            L.append(f"   Если вложить $100 сразу: средняя цена хуже лучшей на "
+                     f"{statistics.median(slips):.2f}¢ (медиана)")
+        L += ["", "   Читать так: «в пределах +1¢ медиана 25$» = в половине случаев",
+              "   больше $25 в одну сделку не влезет без потери преимущества.",
+              "   Это и есть потолок: ставку выше него поднимать бессмысленно."]
+    else:
+        L.append("   пока нет данных (нужны сверки стакана)")
+
     L += ["", "Что это даёт: доля исполнения из п.2 — множитель к результату симулятора.",
           "Если там 40%, то +18% на сделку в симуляции превращаются примерно в +7%,",
           "и то лишь если мы не теряем именно лучшие сделки. Реальные заявки на $1-2",

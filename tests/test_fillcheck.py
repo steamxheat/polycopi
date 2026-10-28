@@ -304,6 +304,36 @@ class LoggingTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class DepthTests(unittest.TestCase):
+    """Потолок по объёму: стакан 30 билетов по 60¢, 50 по 61¢, 100 по 65¢."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.w, _, _ = mkw(self.tmp)
+        self.bk = {"asks": [{"price": "0.65", "size": "100"},
+                            {"price": "0.60", "size": "30"},
+                            {"price": "0.61", "size": "50"}]}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_depth_by_price_limit(self):
+        d = self.w.depth(self.bk, 0.60)
+        self.assertAlmostEqual(d["usd_at_best"], 30 * 0.60, places=2)
+        self.assertAlmostEqual(d["usd_within_1c"], 30 * 0.60 + 50 * 0.61, places=2)
+        self.assertAlmostEqual(d["usd_within_3c"], d["usd_within_1c"], places=2)  # 65¢ вне +3¢
+
+    def test_vwap_of_100_usd_is_worse_than_best(self):
+        d = self.w.depth(self.bk, 0.60)
+        self.assertGreater(d["vwap_100usd"], 0.60)        # цена поехала вверх
+        self.assertLess(d["vwap_100usd"], 0.65)
+
+    def test_empty_book(self):
+        d = self.w.depth({"asks": []}, 0.60)
+        self.assertEqual(d["usd_at_best"], 0)
+        self.assertEqual(d["vwap_100usd"], "")
+
+
 class PctTests(unittest.TestCase):
     def test_pct(self):
         xs = list(range(1, 101))
