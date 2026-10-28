@@ -16,7 +16,7 @@ if [ "$1" = "--reset-mm" ]; then
   [ -d data_mm ] && mv data_mm "data_mm_old_$(date +%Y%m%d_%H%M)" && echo "== данные маркет-мейкера отложены"
 fi
 # перезапускаем только тех ботов, что сейчас запущены (остановленные не трогаем)
-RUNNING=$(pm2 jlist 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin) if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard","polymm-fast","polymm-eth","polymm-alts","polymm-wide10","polymm-wide16","polyfv-tune") and p["pm2_env"]["status"]=="online"))')
+RUNNING=$(pm2 jlist 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p["name"] for p in json.load(sys.stdin) if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard","polymm-fast","polymm-eth","polymm-alts","polymm-wide10","polymm-wide16","polymm-wide20","polymm-wide26","polyfv-tune") and p["pm2_env"]["status"]=="online"))')
 [ -n "$RUNNING" ] && pm2 restart $RUNNING --update-env >/dev/null && pm2 save >/dev/null
 echo "== перезапущены: ${RUNNING:-никто}"
 echo "== жду 90 с..."
