@@ -314,9 +314,12 @@ class PriceFeed:
             if sym != symbol or not h or now - h[-1][0] > window_s:
                 continue
             last = h[-1][1]
-            for t, p in h:
-                if now - t <= window_s:
-                    mx = max(mx, abs(last - p) / p * 1e4)
+            for t, p in reversed(h):          # с конца: дальше окна не идём
+                if now - t > window_s:
+                    break
+                d = abs(last - p) / p * 1e4
+                if d > mx:
+                    mx = d
         return mx
 
     def sources_alive(self, now: float, within: float = 10) -> list[str]:
@@ -734,14 +737,14 @@ class Engine:
                             self.info(f"ДОГОНЯЮ #{p.id} {other.leg}: {other.price:.2f} -> {target:.2f}")
                             self.event(ev="chase", pair=p.id, leg=other.leg, old=other.price, new=target)
 
-    def on_book_event(self, ev: dict, tokens: dict):
-        """Середина стакана Up из ленты CLOB; резкий сдвиг = снять неисполненные пары рынка."""
+    @staticmethod
+    def parse_book_event(ev: dict, wanted) -> list:
+        """[(токен, лучший бид, лучший аск)] из сообщения ленты CLOB (только токены из wanted)."""
         items = ev.get("price_changes") if isinstance(ev.get("price_changes"), list) else [ev]
-        now = self.api.now()
+        out = []
         for it in items:
             tok = str(it.get("asset_id") or ev.get("asset_id") or "")
-            mk = tokens.get(tok)
-            if mk is None:
+            if tok not in wanted:
                 continue
             bb, ba = it.get("best_bid"), it.get("best_ask")
             if (bb is None or ba is None) and ev.get("event_type") == "book":
@@ -754,18 +757,28 @@ class Engine:
                 continue
             if bb <= 0 or ba <= 0 or ba < bb:
                 continue
-            self.tob[tok] = (bb, ba, now)
-            mid = (bb + ba) / 2
-            if tok == mk.down_token:
-                mid = 1 - mid                       # приводим к цене Up
-            h = self.book_hist.setdefault(mk.slug, deque())
-            h.append((now, mid))
-            while h and now - h[0][0] > self.cfg["book_move_window_s"]:
-                h.popleft()
-            lo, hi = min(p for _, p in h), max(p for _, p in h)
-            if (hi - lo) >= self.cfg["book_move_ticks"] * mk.tick - 1e-9:
-                self.on_book_move(mk, hi - lo)
-                h.clear()
+            out.append((tok, bb, ba))
+        return out
+
+    def on_book_event(self, ev: dict, tokens: dict):
+        """Середина стакана Up из ленты CLOB; резкий сдвиг = снять неисполненные пары рынка."""
+        for tok, bb, ba in self.parse_book_event(ev, tokens):
+            self.apply_book(tokens[tok], tok, bb, ba)
+
+    def apply_book(self, mk: Market, tok: str, bb: float, ba: float):
+        now = self.api.now()
+        self.tob[tok] = (bb, ba, now)
+        mid = (bb + ba) / 2
+        if tok == mk.down_token:
+            mid = 1 - mid                       # приводим к цене Up
+        h = self.book_hist.setdefault(mk.slug, deque())
+        h.append((now, mid))
+        while h and now - h[0][0] > self.cfg["book_move_window_s"]:
+            h.popleft()
+        lo, hi = min(p for _, p in h), max(p for _, p in h)
+        if (hi - lo) >= self.cfg["book_move_ticks"] * mk.tick - 1e-9:
+            self.on_book_move(mk, hi - lo)
+            h.clear()
 
     def on_book_move(self, mk: Market, delta: float):
         now = self.api.now()
@@ -1515,9 +1528,14 @@ class Fanout:
             e.ws_last_msg = v
 
     def on_book_event(self, ev: dict, tokens: dict):
+        parsed = Engine.parse_book_event(ev, tokens)          # разбираем один раз на всех
+        if not parsed:
+            return
         for e, toks in self._per_engine():
-            if toks:
-                e.on_book_event(ev, toks)
+            for tok, bb, ba in parsed:
+                mk = toks.get(tok)
+                if mk is not None:
+                    e.apply_book(mk, tok, bb, ba)
 
     def on_trade(self, mk, tr: dict, source: str = "api"):
         tok = str(tr.get("asset"))
@@ -1557,6 +1575,22 @@ def build_multi(base: dict, variants: list[dict], api, root: Path) -> list:
     return engines
 
 
+async def shared_move_watch(engines: list, stop: asyncio.Event):
+    """Рывки биржи считаем один раз (цены общие) и раздаём вариантам."""
+    e0 = engines[0]
+    while not stop.is_set():
+        now = e0.api.now()
+        for asset, sym in e0.cfg["assets"].items():
+            bps = e0.prices.move_bps(sym, now, e0.cfg["move_window_s"])
+            for e in engines:
+                if asset in e.cfg["assets"] and bps >= e.cfg["move_threshold_bps"]:
+                    e.on_price_move(asset, bps)
+        try:
+            await asyncio.wait_for(stop.wait(), e0.cfg["move_watch_s"])
+        except asyncio.TimeoutError:
+            pass
+
+
 async def run_multi(path: Path, log_dir: Path):
     base, variants = load_multi(path)
     setup_logging(log_dir, base)
@@ -1585,7 +1619,8 @@ async def run_multi(path: Path, log_dir: Path):
     if base["use_clob_ws"]:
         loops.append(clob_ws_loop(Fanout(engines), stop))
     for e in engines:
-        loops += [main_loop(e, stop), move_watch(e, stop)]
+        loops.append(main_loop(e, stop))
+    loops.append(shared_move_watch(engines, stop))
     tasks = [asyncio.ensure_future(x) for x in loops]
     await stop.wait()
     for t in tasks:
