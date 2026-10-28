@@ -226,32 +226,22 @@ class Watcher:
                 self.count("signals")
 
     def resolve_pending(self):
+        """Горизонты считаем ПО ИСТОРИИ аска, а не в момент опроса: иначе
+        задержка самого опроса приписывается цене и занижает наши шансы."""
         now = self.api.now()
         while self.pending and (now - self.pending[0]["t0"]) * 1000 >= HORIZONS_MS[-1]:
-            p = self.pending.popleft()
-            self._finish(p, now)
-        tol = self.cfg["fill_tolerance"]
-        for p in self.pending:
-            el = (now - p["t0"]) * 1000
-            for t in HORIZONS_MS:
-                if t not in p["ok"] and el >= t:
-                    a = self.book.ask.get(p["tok"])
-                    p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
-                    p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
+            self._finish(self.pending.popleft())
 
-    def _finish(self, p, now):
-        el = (now - p["t0"]) * 1000
+    def _finish(self, p):
         tol = self.cfg["fill_tolerance"]
         for t in HORIZONS_MS:
-            if t not in p["ok"]:
-                a = self.book.ask.get(p["tok"]) if el >= t else None
-                p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
-                p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
+            a = self.book.ask_at(p["tok"], p["t0"] + t / 1000)
+            p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
+            p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
         self.surv.append((p["ask0"], [p["ok"][t] for t in HORIZONS_MS]))
         row = {"time_utc": utc(p["t0"]), "asset": p["mk"].asset, "window": p["mk"].window,
                "tok": p["tok"][:12], "side": p["side"], "ask0": round(p["ask0"], 4),
-               "move_bps": round(p["mv"], 2),
-               "ask_age_s": round(p["age"], 2)}
+               "move_bps": round(p["mv"], 2), "ask_age_s": round(p["age"], 2)}
         row.update({f"ok_{t}": p["ok"][t] for t in HORIZONS_MS})
         row.update({f"okt_{t}": p["okt"][t] for t in HORIZONS_MS})
         self._csv("survive.csv", SURV_COLS, row)

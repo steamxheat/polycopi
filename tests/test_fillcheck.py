@@ -153,7 +153,6 @@ class SurvivalTests(unittest.TestCase):
         w, api, _ = self.arm()
         w.check_signals()
         api.t += 0.12
-        w.resolve_pending()                             # 50 и 100 мс — успели
         w.book.on_event({"event_type": "book", "asset_id": "U",
                          "asks": [{"price": "0.70", "size": "10"}]}, api.t)
         for _ in range(30):
@@ -204,7 +203,7 @@ class SurvivalTests(unittest.TestCase):
             w.resolve_pending()
         r = fillcheck.rows(self.tmp / "survive.csv")[0]
         self.assertEqual((r["ok_200"], r["okt_200"]), ("0", "1"))
-        self.assertEqual((r["ok_50"], r["okt_50"]), ("1", "1"))   # до сдвига успели
+        self.assertEqual((r["ok_50"], r["okt_50"]), ("1", "1"))   # на 50 мс цена была старой
 
     def test_beyond_tolerance_misses_both(self):
         w, api, _ = self.arm(fill_tolerance=0.01)
@@ -217,6 +216,19 @@ class SurvivalTests(unittest.TestCase):
             w.resolve_pending()
         r = fillcheck.rows(self.tmp / "survive.csv")[0]
         self.assertEqual((r["ok_200"], r["okt_200"]), ("0", "0"))
+
+    def test_late_poll_does_not_distort_horizons(self):
+        """Опрос пришёл с опозданием на 2 с, но цена менялась на 300 мс —
+        горизонты до 300 мс должны остаться успешными."""
+        w, api, _ = self.arm()
+        w.check_signals()
+        api.t += 0.30
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.80", "size": "10"}]}, api.t)
+        api.t += 2.0                                  # единственный опрос — сильно позже
+        w.resolve_pending()
+        r = fillcheck.rows(self.tmp / "survive.csv")[0]
+        self.assertEqual([r[f"ok_{t}"] for t in HORIZONS_MS], ["1", "1", "1", "0", "0"])
 
     def test_signal_not_repeated_within_gap(self):
         w, api, _ = self.arm(signal_gap_s=5.0)
