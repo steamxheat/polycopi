@@ -233,6 +233,24 @@ class GhostTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Нет данных", fillcheck.report(self.tmp))
 
 
+class LoggingTests(unittest.TestCase):
+    def test_uses_project_logger(self):
+        """Строки статуса должны попадать в тот же журнал, что у остальных ботов.
+        Отдельный логгер остаётся без обработчиков, и сообщения молча теряются."""
+        import mmsim
+        self.assertIs(fillcheck.log, mmsim.log)
+
+    def test_status_failure_does_not_kill_loop(self):
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            w, api, _ = mkw(tmp)
+            w.prices = None                      # сломаем статус намеренно
+            with self.assertRaises(Exception):
+                w.status()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class PctTests(unittest.TestCase):
     def test_pct(self):
         xs = list(range(1, 101))

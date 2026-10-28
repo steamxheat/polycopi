@@ -38,7 +38,7 @@ import mmsim
 from core import _as_list
 from mmsim import Api, PriceFeed, best, utc
 
-log = logging.getLogger("fill")
+log = mmsim.log            # тот же журнал, что у остальных ботов (polymm)
 HERE = Path(__file__).resolve().parent
 
 HORIZONS_MS = (50, 100, 200, 500, 1000)
@@ -331,7 +331,10 @@ async def main_loop(w: Watcher, stop: asyncio.Event):
         except Exception as e:  # noqa: BLE001
             log.exception(f"loop: {e}")
         if now - last_status >= w.cfg["status_every_s"]:
-            w.status()
+            try:
+                w.status()
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"status: {e}")
             last_status = now
         try:
             await asyncio.wait_for(stop.wait(), w.cfg["loop_s"])
@@ -341,8 +344,6 @@ async def main_loop(w: Watcher, stop: asyncio.Event):
 
 async def run(cfg: dict, out: Path):
     fvsim.setup_logging(out, cfg)
-    global log
-    log = logging.getLogger("fv")
     w = Watcher(cfg, Api(cfg), out)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
