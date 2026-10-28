@@ -719,3 +719,18 @@ class MultiTests(unittest.IsolatedAsyncioTestCase):
             mmsim.Api.get_book = orig
         self.assertEqual(r[0], {"t": "1"})
         self.assertEqual(sorted(calls), ["1", "2"])
+
+
+class PerpFeedTests(unittest.TestCase):
+    def test_perp_parsers_and_rets(self):
+        self.assertEqual(mmsim.parse_bybit_trades({"topic": "publicTrade.BTCUSDT", "data": [{"s": "BTCUSDT", "p": "1"}]}),
+                         [("BTCUSDT", 1.0)])
+        self.assertEqual(mmsim.parse_okx_swap({"arg": {"channel": "trades"}, "data": [{"instId": "ETH-USDT-SWAP", "px": "2"}]}),
+                         [("ETHUSDT", 2.0)])
+        f = PriceFeed(["BTCUSDT"])
+        for src, p2 in (("bybit_perp", 100.05), ("coinbase_ws", 100.0)):
+            f.add("BTCUSDT", 10.0, 100.0, src)
+            f.add("BTCUSDT", 11.5, p2, src)
+        r = f.rets_bps("BTCUSDT", 11.5, 1.0)
+        self.assertEqual(sorted(round(x, 1) for x in r), [0.0, 5.0])
+        self.assertEqual([round(x, 1) for x in f.rets_bps("BTCUSDT", 11.5, 1.0, ["bybit_perp"])], [5.0])

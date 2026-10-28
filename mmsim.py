@@ -106,6 +106,10 @@ DEFAULTS = {
     "coinbase_ws": "wss://ws-feed.exchange.coinbase.com",
     "okx_ws": "wss://ws.okx.com:8443/ws/v5/public",
     "use_binance_ws": True,         # прямой поток Binance (может резаться сетью сервера)
+    # бессрочные фьючерсы: по замеру из Нидерландов приносят рывок раньше всех (Binance-зеркало опаздывает ~0.7 с)
+    "use_bybit_perp_ws": False,
+    "use_okx_perp_ws": False,
+    "bybit_perp_ws": "wss://stream.bybit.com/v5/public/linear",
     "rtds_url": "wss://ws-live-data.polymarket.com",
     "rest_fallback_after_s": 2,     # опрос REST, если потоки молчат дольше N с
     "binance_rest": "https://data-api.binance.vision",
@@ -309,6 +313,21 @@ class PriceFeed:
             if past:
                 vals.append((h[-1][1] / past - 1) * 1e4)
         return round(statistics.median(vals), 2) if vals else None
+
+    def rets_bps(self, symbol: str, now: float, window_s: float, sources=None, fresh_s: float = 3.0) -> list:
+        """Изменение цены за window_s у каждого (выбранного) источника, б.п. со знаком."""
+        out = []
+        for (sym, src), h in self.hist.items():
+            if sym != symbol or not h or now - h[-1][0] > fresh_s or (sources and src not in sources):
+                continue
+            past = None
+            for ts, px in reversed(h):
+                if ts <= now - window_s:
+                    past = px
+                    break
+            if past:
+                out.append((h[-1][1] / past - 1) * 1e4)
+        return out
 
     def move_bps(self, symbol: str, now: float, window_s: float) -> float:
         """Максимальное отклонение последней цены от любой цены за окно, в б.п."""
@@ -1352,6 +1371,48 @@ def coinbase_loop(eng: Engine, stop: asyncio.Event):
     return generic_price_ws(eng, stop, "coinbase_ws", eng.cfg["coinbase_ws"], sub, parse_coinbase, None, 0)
 
 
+def parse_bybit_trades(msg: dict):
+    out = []
+    if isinstance(msg, dict) and str(msg.get("topic", "")).startswith("publicTrade."):
+        for d in msg.get("data") or []:
+            if d.get("p") and d.get("s"):
+                out.append((str(d["s"]), float(d["p"])))
+    return out
+
+
+def parse_okx_swap(msg: dict):
+    out = []
+    if isinstance(msg, dict) and (msg.get("arg") or {}).get("channel") == "trades":
+        for d in msg.get("data") or []:
+            inst = str(d.get("instId", ""))
+            if inst.endswith("-SWAP") and d.get("px"):
+                out.append((inst.replace("-SWAP", "").replace("-", ""), float(d["px"])))
+    return out
+
+
+def bybit_perp_loop(eng, stop: asyncio.Event):
+    args = [f"publicTrade.{s}" for s in eng.cfg["assets"].values()]
+    sub = json.dumps({"op": "subscribe", "args": args})
+    return generic_price_ws(eng, stop, "bybit_perp", eng.cfg["bybit_perp_ws"], sub, parse_bybit_trades,
+                            json.dumps({"op": "ping"}), 20)
+
+
+def okx_perp_loop(eng, stop: asyncio.Event):
+    args = [{"channel": "trades", "instId": OKX_INST[s] + "-SWAP"} for s in eng.cfg["assets"].values()
+            if s in OKX_INST]
+    sub = json.dumps({"op": "subscribe", "args": args})
+    return generic_price_ws(eng, stop, "okx_perp", eng.cfg["okx_ws"], sub, parse_okx_swap, "ping", 20)
+
+
+def extra_feed_loops(eng, cfg: dict, stop: asyncio.Event) -> list:
+    loops = []
+    if cfg.get("use_bybit_perp_ws"):
+        loops.append(bybit_perp_loop(eng, stop))
+    if cfg.get("use_okx_perp_ws"):
+        loops.append(okx_perp_loop(eng, stop))
+    return loops
+
+
 def okx_loop(eng: Engine, stop: asyncio.Event):
     args = [{"channel": "tickers", "instId": OKX_INST[s]} for s in eng.cfg["assets"].values() if s in OKX_INST]
     sub = json.dumps({"op": "subscribe", "args": args})
@@ -1432,6 +1493,7 @@ async def run(cfg: dict, out: Path):
         loops.append(coinbase_loop(eng, stop))
     if cfg["use_okx_ws"]:
         loops.append(okx_loop(eng, stop))
+    loops += extra_feed_loops(eng, cfg, stop)
     if cfg["use_clob_ws"]:
         loops.append(clob_ws_loop(eng, stop))
     tasks = [asyncio.ensure_future(x) for x in loops]
@@ -1619,6 +1681,7 @@ async def run_multi(path: Path, log_dir: Path):
         loops.append(coinbase_loop(e0, stop))
     if base["use_okx_ws"]:
         loops.append(okx_loop(e0, stop))
+    loops += extra_feed_loops(e0, base, stop)
     if base["use_clob_ws"]:
         loops.append(clob_ws_loop(Fanout(engines), stop))
     for e in engines:

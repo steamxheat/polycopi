@@ -100,6 +100,11 @@ DEFAULTS = {
     "binance_rest": "https://data-api.binance.vision",
     "coinbase_ws": "wss://ws-feed.exchange.coinbase.com",
     "okx_ws": "wss://ws.okx.com:8443/ws/v5/public",
+    "use_bybit_perp_ws": False, "use_okx_perp_ws": False,
+    "bybit_perp_ws": "wss://stream.bybit.com/v5/public/linear",
+    # по каким источникам ловим «рывок» для запаздывающих вариантов (None = все) и сколько должны согласиться
+    "lead_sources": None,
+    "lead_agree": 1,
 }
 
 
@@ -398,8 +403,10 @@ class Engine:
         now = self.api.now()
         if now - self._last_trig < self.cfg.get("trigger_gap_s", 0.02):
             return
-        mv = self.prices.ret_bps(symbol, now, self._trig_s)
-        if mv is not None and abs(mv) >= self._trig_bps:
+        rets = self.prices.rets_bps(symbol, now, self._trig_s, self.cfg.get("lead_sources"))
+        agree = self.cfg.get("lead_agree", 1)
+        if (sum(1 for x in rets if x >= self._trig_bps) >= agree
+                or sum(1 for x in rets if -x >= self._trig_bps) >= agree):
             self._last_trig = now
             self.count("fast_trigger")
             try:
@@ -457,8 +464,9 @@ class Engine:
                     if "move_bps" in sp:
                         # «запаздывание»: биржа уже сдвинулась в нашу сторону, а аск на Polymarket ещё нет
                         sym = cfg["assets"][m.asset]
-                        mv = self.prices.ret_bps(sym, now, sp.get("move_s", 1.0))
-                        if mv is None or (mv if side == "Up" else -mv) < sp["move_bps"]:
+                        rets = self.prices.rets_bps(sym, now, sp.get("move_s", 1.0), cfg.get("lead_sources"))
+                        sgn = 1 if side == "Up" else -1
+                        if sum(1 for x in rets if sgn * x >= sp["move_bps"]) < cfg.get("lead_agree", 1):
                             continue
                         if now - self.book.ask_t.get(tok, now) < sp.get("ask_stale_s", 0):
                             continue
@@ -701,6 +709,7 @@ async def run(cfg: dict, out: Path):
         loops.append(mmsim.okx_loop(eng, stop))
     if cfg["use_binance_ws"]:
         loops.append(mmsim.binance_ws_loop(eng, stop))
+    loops += mmsim.extra_feed_loops(eng, cfg, stop)
     tasks = [asyncio.ensure_future(x) for x in loops]
     await stop.wait()
     for t in tasks:
