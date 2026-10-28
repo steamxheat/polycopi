@@ -654,3 +654,68 @@ class ExamTests(unittest.TestCase):
         d["done_pairs"] = done[:10]
         self.assertIn("❌", exam(d))
         self.assertEqual(Account.from_dict(a.to_dict()).rebates, 1.5)
+
+
+class MultiTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.api = FakeApi()
+        self.api.markets[SLUG] = gamma_market()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    async def test_variants_share_feed_and_fill_independently(self):
+        spec = {"base": {"assets": {"btc": "BTCUSDT"}, "resolve_every_s": 0, "fair_mode": "book"},
+                "variants": [{"name": "e04", "edge": 0.04, "out": str(self.tmp / "a")},
+                             {"name": "e20", "edge": 0.20, "out": str(self.tmp / "b")}]}
+        p = self.tmp / "grid.json"
+        p.write_text(json.dumps(spec))
+        base, variants = mmsim.load_multi(p)
+        engines = mmsim.build_multi(base, variants, self.api, self.tmp)
+        for e in engines:
+            e.quiet = True
+        self.assertIs(engines[0].prices, engines[1].prices)
+        for e in engines:
+            await e.step()
+        prices = []
+        for e in engines:
+            pr = e.pairs[e.markets[SLUG].pairs[0]]
+            prices.append(e.orders[pr.up].price)
+        self.assertEqual(prices, [0.48, 0.40])
+        fan = mmsim.Fanout(engines)
+        self.assertEqual(set(fan.live_tokens()), {UP, DN})
+        fan.ws_begin([START, START + 100])
+        self.api.t = START + 12
+        # сделка по 0.45: ниже 0.48 (e04 исполнен), выше 0.40 (e20 нет)
+        fan.on_trade(None, {"asset": UP, "price": 0.45, "size": 50, "timestamp": START + 11,
+                            "transactionHash": "0x1", "proxyWallet": "x"}, "ws")
+        f = [e.orders[e.pairs[e.markets[SLUG].pairs[0]].up].filled for e in engines]
+        self.assertEqual(f, [5, 0])
+        txt = mmsim.grid_report(p)
+        self.assertIn("e04", txt)
+        self.assertIn("нет данных", txt)          # состояния ещё не сохранены
+        for e in engines:
+            e.save()
+        self.assertIn("0.80", mmsim.grid_report(p))
+
+    async def test_shared_api_coalesces_book_requests(self):
+        calls = []
+
+        class A(mmsim.SharedApi):
+            pass
+        api = A({"clob_url": "x", "gamma_url": "x", "data_url": "x", "binance_rest": "x"})
+
+        async def fake(self, token):
+            calls.append(token)
+            await asyncio.sleep(0.01)
+            return {"t": token}
+        orig = mmsim.Api.get_book
+        mmsim.Api.get_book = fake
+        try:
+            r = await asyncio.gather(api.get_book("1"), api.get_book("1"), api.get_book("2"))
+            await api.get_book("1")
+        finally:
+            mmsim.Api.get_book = orig
+        self.assertEqual(r[0], {"t": "1"})
+        self.assertEqual(sorted(calls), ["1", "2"])

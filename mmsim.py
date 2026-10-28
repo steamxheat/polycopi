@@ -415,7 +415,13 @@ class Engine:
 
     # ------------------------------------------------------------ io
     def info(self, m):
-        (log.debug if self.quiet else log.info)(m)
+        tag = getattr(self, "tag", "")
+        (log.debug if self.quiet else log.info)(f"[{tag}] {m}" if tag else m)
+
+    def ws_begin(self, interval: list):
+        """Начался период работы ленты CLOB (interval — общий список [начало, конец])."""
+        self.ws_intervals.append(interval)
+        self.ws_intervals[:] = self.ws_intervals[-200:]
 
     def event(self, **kw):
         kw = {"t": round(self.api.now(), 3), "time_utc": utc(self.api.now()), **kw}
@@ -1098,7 +1104,9 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
         backoff = min(backoff * 2, 60)
 
 
-def _live_tokens(eng: Engine) -> dict:
+def _live_tokens(eng) -> dict:
+    if hasattr(eng, "live_tokens"):
+        return eng.live_tokens()
     out = {}
     for mk in eng.markets.values():
         if not mk.resolved and eng.api.now() <= mk.end_ts + 10:
@@ -1123,8 +1131,7 @@ async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
             ws = await WebSocket.connect(eng.cfg["clob_ws"])
             await ws.send(json.dumps({"assets_ids": list(tokens), "type": "market"}))
             interval = [eng.api.now(), eng.api.now()]
-            eng.ws_intervals.append(interval)
-            eng.ws_intervals[:] = eng.ws_intervals[-200:]
+            eng.ws_begin(interval)
             log.debug(f"CLOB WS: подписка на {len(tokens)} токенов")
             backoff = 1
 
@@ -1418,6 +1425,200 @@ async def run(cfg: dict, out: Path):
     await asyncio.gather(*tasks, return_exceptions=True)
     eng.save()
     eng.info("Остановлено, состояние сохранено. Отчёт: python3 mmsim.py report")
+
+
+
+# ======================================================================= multi (много вариантов в одном процессе)
+
+class SharedApi(Api):
+    """Один Api на все варианты: одинаковые запросы в пределах долей секунды склеиваются."""
+
+    def __init__(self, cfg, book_ttl: float = 0.3, market_ttl: float = 15.0):
+        super().__init__(cfg)
+        self.book_ttl, self.market_ttl = book_ttl, market_ttl
+        self._cache: dict = {}
+        self._inflight: dict = {}
+
+    async def _cached(self, key, ttl, factory):
+        now = time.time()
+        hit = self._cache.get(key)
+        if hit and now - hit[0] <= ttl:
+            return hit[1]
+        fut = self._inflight.get(key)
+        if fut is None:
+            fut = asyncio.ensure_future(factory())
+            self._inflight[key] = fut
+            try:
+                res = await fut
+                self._cache[key] = (time.time(), res)
+                if len(self._cache) > 2000:
+                    for k in [k for k, (t, _) in self._cache.items() if now - t > 60]:
+                        del self._cache[k]
+                return res
+            finally:
+                self._inflight.pop(key, None)
+        return await asyncio.shield(fut)
+
+    async def get_book(self, token: str):
+        return await self._cached(("book", token), self.book_ttl, lambda: Api.get_book(self, token))
+
+    async def get_market(self, slug: str, closed: bool | None = None):
+        if closed:
+            return await Api.get_market(self, slug, closed)
+        return await self._cached(("mkt", slug), self.market_ttl, lambda: Api.get_market(self, slug, closed))
+
+    async def get_trades(self, condition_id: str, limit: int = 500):
+        return await self._cached(("tr", condition_id, limit), 1.0,
+                                  lambda: Api.get_trades(self, condition_id, limit))
+
+
+class Fanout:
+    """Притворяется движком для ленты CLOB и раздаёт каждое сообщение всем вариантам."""
+
+    def __init__(self, engines: list):
+        self.engines = engines
+        e0 = engines[0]
+        self.cfg, self.api, self.counters = e0.cfg, e0.api, e0.counters
+        self._tok_cache: tuple = (0.0, [])
+
+    def count(self, k, n=1):
+        self.engines[0].count(k, n)
+
+    def info(self, m):
+        log.info(f"[все] {m}")
+
+    def _per_engine(self):
+        t, v = self._tok_cache
+        now = self.api.now()
+        if now - t > 0.5:
+            v = [(e, _live_tokens(e)) for e in self.engines]
+            self._tok_cache = (now, v)
+        return v
+
+    def live_tokens(self) -> dict:
+        out = {}
+        for e in self.engines:
+            out.update(_live_tokens(e))
+        return out
+
+    def ws_begin(self, interval: list):
+        for e in self.engines:
+            e.ws_begin(interval)
+
+    @property
+    def ws_last_msg(self):
+        return self.engines[0].ws_last_msg
+
+    @ws_last_msg.setter
+    def ws_last_msg(self, v):
+        for e in self.engines:
+            e.ws_last_msg = v
+
+    def on_book_event(self, ev: dict, tokens: dict):
+        for e, toks in self._per_engine():
+            if toks:
+                e.on_book_event(ev, toks)
+
+    def on_trade(self, mk, tr: dict, source: str = "api"):
+        tok = str(tr.get("asset"))
+        for e, toks in self._per_engine():
+            m = toks.get(tok)
+            if m is not None:
+                e.on_trade(m, tr, source)
+
+
+def load_multi(path: Path) -> tuple[dict, list[dict]]:
+    """{"base": {...} или "имя.json", "variants": [{"name":..., "out":..., <настройки>}]}"""
+    spec = json.loads(path.read_text())
+    base = spec.get("base") or {}
+    if isinstance(base, str):
+        base = json.loads((path.parent / base).read_text())
+    cfg = json.loads(json.dumps(DEFAULTS))
+    cfg.update(base)
+    variants = []
+    for v in spec["variants"]:
+        c = json.loads(json.dumps(cfg))
+        c.update({k: x for k, x in v.items() if k not in ("name", "out")})
+        if not set(c["assets"]) <= set(cfg["assets"]):
+            raise ValueError(f"вариант {v['name']}: монеты должны быть из базовых {list(cfg['assets'])}")
+        variants.append({"name": v["name"], "out": v.get("out", f"data_mm_{v['name']}"), "cfg": c})
+    return cfg, variants
+
+
+def build_multi(base: dict, variants: list[dict], api, root: Path) -> list:
+    prices = PriceFeed(list(base["assets"].values()))
+    sampler = fvmodel.Sampler(prices)
+    engines = []
+    for v in variants:
+        out = Path(v["out"]) if Path(v["out"]).is_absolute() else root / v["out"]
+        e = Engine(v["cfg"], api, out)
+        e.prices, e.sampler, e.tag = prices, sampler, v["name"]
+        engines.append(e)
+    return engines
+
+
+async def run_multi(path: Path, log_dir: Path):
+    base, variants = load_multi(path)
+    setup_logging(log_dir, base)
+    api = SharedApi(base)
+    engines = build_multi(base, variants, api, HERE)
+    e0 = engines[0]
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(s, stop.set)
+        except NotImplementedError:
+            pass
+    log.info(f"Старт мейкера с {len(engines)} вариантами в одном процессе: "
+             + ", ".join(f"{e.tag}(пара {1 - e.cfg['edge']:.2f})" for e in engines)
+             + f" | монеты {', '.join(a.upper() for a in base['assets'])}")
+    loops = [binance_rest_loop(e0, stop)]
+    if base["use_binance_ws"]:
+        loops.append(binance_ws_loop(e0, stop))
+    if base["use_rtds_prices"]:
+        loops.append(rtds_price_loop(e0, stop))
+    if base["use_coinbase_ws"]:
+        loops.append(coinbase_loop(e0, stop))
+    if base["use_okx_ws"]:
+        loops.append(okx_loop(e0, stop))
+    if base["use_clob_ws"]:
+        loops.append(clob_ws_loop(Fanout(engines), stop))
+    for e in engines:
+        loops += [main_loop(e, stop), move_watch(e, stop)]
+    tasks = [asyncio.ensure_future(x) for x in loops]
+    await stop.wait()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    for e in engines:
+        e.save()
+    log.info("Остановлено, состояния вариантов сохранены.")
+
+
+def grid_report(path: Path) -> str:
+    """Одна строка на вариант: где проходит граница плюса."""
+    _, variants = load_multi(path)
+    L = [f"{'вариант':<8} {'пара':>5} {'часов':>5} {'счёт':>8} {'PnL':>8} {'полных':>6} "
+         f"{'ног +/-':>8} {'выигр.ног':>9} {'PnL ног':>8}"]
+    for v in variants:
+        out = Path(v["out"]) if Path(v["out"]).is_absolute() else HERE / v["out"]
+        sp = out / "state.json"
+        if not sp.exists():
+            L.append(f"{v['name']:<8} {1 - v['cfg']['edge']:>5.2f}   нет данных")
+            continue
+        d = json.loads(sp.read_text())
+        a = Account.from_dict(d["account"])
+        done = [x for x in d.get("done_pairs", []) if x["outcome"] != "no_fill"]
+        comp = [x for x in done if x["outcome"].endswith("complete")]
+        win = [x for x in done if x["outcome"].endswith("one_leg_win")]
+        loss = [x for x in done if x["outcome"].endswith("one_leg_loss")]
+        legs = win + loss
+        hours = max((d["saved"] - d["started"]) / 3600, 0)
+        L.append(f"{v['name']:<8} {1 - v['cfg']['edge']:>5.2f} {hours:>5.1f} {a.equity_at_cost():>8.2f} "
+                 f"{a.realized:>+8.2f} {len(comp):>6} {len(win):>3}/{len(loss):<4} "
+                 f"{(len(win) / len(legs) * 100 if legs else 0):>8.0f}% {sum(x['pnl'] for x in legs):>+8.2f}")
+    return "\n".join(L)
 
 
 # ======================================================================= report
@@ -1794,11 +1995,17 @@ def learn_report(outs: list[Path]) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Симулятор маркет-мейкера Polymarket 5m BTC/ETH")
-    ap.add_argument("cmd", choices=["run", "report", "check", "diag", "learn"])
+    ap.add_argument("cmd", choices=["run", "report", "check", "diag", "learn", "multi", "grid"])
     ap.add_argument("--config", default=str(HERE / "mm_config.json"))
     ap.add_argument("--out", default=str(HERE / "data_mm"),
                     help="папка данных; для learn можно несколько через запятую")
     a = ap.parse_args()
+    if a.cmd in ("multi", "grid"):
+        if a.cmd == "multi":
+            asyncio.run(run_multi(Path(a.config), Path(a.out)))
+        else:
+            print(grid_report(Path(a.config)))
+        return
     cfg = load_config(Path(a.config))
     if a.cmd == "run":
         asyncio.run(run(cfg, Path(a.out)))

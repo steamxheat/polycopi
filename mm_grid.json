@@ -1,0 +1,40 @@
+{
+  "base": "mm_fast.json",
+  "variants": [
+    {
+      "name": "p96",
+      "edge": 0.04,
+      "out": "data_mmg_96"
+    },
+    {
+      "name": "p90",
+      "edge": 0.1,
+      "out": "data_mmg_90"
+    },
+    {
+      "name": "p84",
+      "edge": 0.16,
+      "out": "data_mmg_84"
+    },
+    {
+      "name": "p80",
+      "edge": 0.2,
+      "out": "data_mmg_80"
+    },
+    {
+      "name": "p74",
+      "edge": 0.26,
+      "out": "data_mmg_74"
+    },
+    {
+      "name": "p68",
+      "edge": 0.32,
+      "out": "data_mmg_68"
+    },
+    {
+      "name": "p60",
+      "edge": 0.4,
+      "out": "data_mmg_60"
+    }
+  ]
+}
