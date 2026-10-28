@@ -524,6 +524,10 @@ class Engine:
                 age = ""
             limit = min(ask + cfg["fill_tolerance"], cfg["max_price"])
             for v, p, edge in items:
+                mx = v.spec.get("max_book_age_ms")
+                if mx is not None and (age == "" or age > mx):
+                    self.count(f"stale_{v.name}")
+                    continue                          # стакан мог устареть — честный вариант не покупает
                 shares = max(5.0, cfg["stake_usd"] / ask)
                 f = walk_book(bk, "BUY", shares, limit, cfg["taker_fee_coef"])
                 if f.shares <= 0:

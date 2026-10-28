@@ -92,6 +92,31 @@
       "move_bps": 3,
       "move_s": 1,
       "ask_not_up": true
+    },
+    {
+      "name": "lag3-1s-t60-fresh",
+      "min_edge": 0.02,
+      "rule": "t60",
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_stale_s": 1,
+      "max_book_age_ms": 200
+    },
+    {
+      "name": "lagN3-1s-fresh",
+      "min_edge": 0.02,
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_not_up": true,
+      "max_book_age_ms": 200
+    },
+    {
+      "name": "lag3-1s-fresh",
+      "min_edge": 0.02,
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_stale_s": 1,
+      "max_book_age_ms": 200
     }
   ],
   "use_binance_ws": false,
