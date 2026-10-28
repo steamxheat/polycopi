@@ -218,6 +218,7 @@ class Book:
                 while h and now - h[0][0] > 10:
                     h.popleft()
             self.ask[tok] = a
+        self.t[tok] = now
 
     def ask_at(self, tok: str, t: float):
         """Аск, который стоял в момент t (None, если не знаем)."""
@@ -228,7 +229,6 @@ class Book:
             else:
                 break
         return best_
-        self.t[tok] = now
 
 
 class Variant:
