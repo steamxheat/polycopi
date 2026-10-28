@@ -43,7 +43,7 @@ import fvmodel
 import mmsim
 from core import resolution_payouts, walk_book, _as_list
 from mmsim import Api, PriceFeed, best, utc
-from net import WebSocket
+from net import WebSocket, fast_loads
 
 HERE = Path(__file__).resolve().parent
 log = mmsim.log            # общие петли цен пишут в этот логгер
@@ -604,7 +604,7 @@ async def clob_book_loop(eng: Engine, stop: asyncio.Event):
                 if raw.strip().upper() == "PONG":
                     continue
                 try:
-                    data = json.loads(raw)
+                    data = fast_loads(raw)
                 except ValueError:
                     continue
                 for ev in (data if isinstance(data, list) else [data]):

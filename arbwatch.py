@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from core import _as_list
-from net import Http, WebSocket
+from net import Http, WebSocket, fast_loads
 
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("arbwatch")
@@ -310,7 +310,7 @@ async def ws_loop(w: Watcher, stop: asyncio.Event):
                 if '"ask' not in raw and '"SELL"' not in raw and '"book"' not in raw:
                     continue                       # нам нужны только продавцы
                 try:
-                    data = json.loads(raw)
+                    data = fast_loads(raw)
                 except ValueError:
                     continue
                 for ev in (data if isinstance(data, list) else [data]):

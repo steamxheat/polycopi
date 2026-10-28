@@ -186,3 +186,13 @@ class WebSocket:
 
 def now() -> float:
     return time.time()
+
+
+try:  # orjson в 3–5 раз быстрее разбирает ленты WebSocket (если установлен)
+    import orjson as _orjson
+
+    def fast_loads(raw):
+        return _orjson.loads(raw)
+except ImportError:  # pragma: no cover
+    def fast_loads(raw):
+        return json.loads(raw)

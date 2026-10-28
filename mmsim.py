@@ -40,7 +40,7 @@ from pathlib import Path
 
 import fvmodel
 from core import resolution_payouts, _as_list
-from net import Http, HttpError, WebSocket
+from net import Http, HttpError, WebSocket, fast_loads
 
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("polymm")
@@ -1075,7 +1075,7 @@ async def binance_ws_loop(eng: Engine, stop: asyncio.Event):
             eng.info("Binance: поток подключён")
             backoff = 1
             while not stop.is_set():
-                msg = json.loads(await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"]))
+                msg = fast_loads(await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"]))
                 d = msg.get("data", msg)
                 if d.get("e") == "aggTrade":
                     # время приёма по своим часам: при расхождении часов сервера и биржи
@@ -1143,7 +1143,7 @@ async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
                 if raw.strip().upper() == "PONG":
                     continue
                 try:
-                    data = json.loads(raw)
+                    data = fast_loads(raw)
                 except ValueError:
                     continue
                 for ev in (data if isinstance(data, list) else [data]):
@@ -1224,7 +1224,7 @@ async def rtds_price_loop(eng: Engine, stop: asyncio.Event):
             while not stop.is_set():
                 raw = await asyncio.wait_for(ws.recv(), eng.cfg["ws_silence_s"])
                 try:
-                    msg = json.loads(raw)
+                    msg = fast_loads(raw)
                 except ValueError:
                     continue
                 pts = parse_rtds_price(msg)
@@ -1298,7 +1298,7 @@ async def generic_price_ws(eng: Engine, stop: asyncio.Event, name: str, url: str
                 if raw in ("pong", "PONG"):
                     continue
                 try:
-                    msg = json.loads(raw)
+                    msg = fast_loads(raw)
                 except ValueError:
                     continue
                 for sym, px in parser(msg):
