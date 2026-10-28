@@ -1,0 +1,127 @@
+{
+ "max_price": 0.985,
+ "variants": [
+  {
+   "name": "fav70-60s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.7,
+   "max_tau": 60
+  },
+  {
+   "name": "fav70-120s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.7,
+   "max_tau": 120
+  },
+  {
+   "name": "fav70-180s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.7,
+   "max_tau": 180
+  },
+  {
+   "name": "fav80-60s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.8,
+   "max_tau": 60
+  },
+  {
+   "name": "fav80-120s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.8,
+   "max_tau": 120
+  },
+  {
+   "name": "fav80-180s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.8,
+   "max_tau": 180
+  },
+  {
+   "name": "fav85-60s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.85,
+   "max_tau": 60
+  },
+  {
+   "name": "fav85-120s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.85,
+   "max_tau": 120
+  },
+  {
+   "name": "fav85-180s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.85,
+   "max_tau": 180
+  },
+  {
+   "name": "fav90-60s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.9,
+   "max_tau": 60
+  },
+  {
+   "name": "fav90-120s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.9,
+   "max_tau": 120
+  },
+  {
+   "name": "fav90-180s",
+   "rule": "t60",
+   "min_edge": 0.03,
+   "min_p": 0.9,
+   "max_tau": 180
+  },
+  {
+   "name": "fav70-120-e2",
+   "rule": "t60",
+   "min_edge": 0.02,
+   "min_p": 0.7,
+   "max_tau": 120
+  },
+  {
+   "name": "fav70-120-e5",
+   "rule": "t60",
+   "min_edge": 0.05,
+   "min_p": 0.7,
+   "max_tau": 120
+  },
+  {
+   "name": "ask80-90-120s",
+   "rule": "t60",
+   "min_edge": 0.0,
+   "min_ask": 0.8,
+   "max_ask": 0.9,
+   "max_tau": 120
+  },
+  {
+   "name": "ask90-95-60s",
+   "rule": "t60",
+   "min_edge": 0.0,
+   "min_ask": 0.9,
+   "max_ask": 0.95,
+   "max_tau": 60
+  },
+  {
+   "name": "ask95-98-120s",
+   "rule": "t60",
+   "min_edge": 0.0,
+   "min_ask": 0.95,
+   "max_ask": 0.985,
+   "max_tau": 120
+  }
+ ]
+}

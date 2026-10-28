@@ -492,6 +492,8 @@ class Engine:
                                 continue
                     if not (sp.get("min_p", 0) <= p <= sp.get("max_p", 1)):
                         continue
+                    if not (sp.get("min_ask", 0) <= ask <= sp.get("max_ask", 1)):
+                        continue
                     if tau < sp.get("min_tau", 0) or tau > sp.get("max_tau", 1e9):
                         continue
                     ent = v.entries.get(tok, [])
