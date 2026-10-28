@@ -6,7 +6,7 @@ echo "############ $(hostname) — $(date -u '+%Y-%m-%d %H:%M UTC')"
 pm2 jlist 2>/dev/null | python3 -c '
 import json,sys
 ps=[p for p in json.load(sys.stdin) if p["name"].startswith("poly")]
-print("боты: " + ", ".join(f"{p[\"name\"]}={p[\"pm2_env\"][\"status\"]}" for p in ps))'
+print("боты: " + ", ".join(p["name"] + "=" + p["pm2_env"]["status"] for p in ps))'
 if [ -f data_fv/state.json ]; then
   echo; echo "=== ТЕЙКЕР (polyfv-sim)"
   python3 fvsim.py report 2>/dev/null | sed -n '1,12p' | grep -vE '^\s*$'
