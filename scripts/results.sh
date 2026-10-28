@@ -27,6 +27,10 @@ if pm2 jlist 2>/dev/null | grep -q '"name":"polymm-grid"'; then
   echo; echo "=== МЕЙКЕР-СЕТКА (polymm-grid): все варианты в одном процессе, старт одновременно"
   python3 mmsim.py grid --config mm_grid.json 2>/dev/null
 fi
+if pm2 jlist 2>/dev/null | grep -q '"name":"polymm-grid2"'; then
+  echo; echo "=== МЕЙКЕР-СЕТКА-2 (polymm-grid2): те же пары, но цены с быстрых фьючерсов (без Binance-зеркала)"
+  python3 mmsim.py grid --config mm_grid2.json 2>/dev/null
+fi
 for d in data_mm_fast data_mm_eth data_mm_wide10 data_mm_wide16 data_mm_wide20 data_mm_wide26 data_mm_wide32 data_mm_wide40 data_mm_alts; do
   [ -f "$d/state.json" ] || continue
   st=$(pm2 jlist 2>/dev/null | python3 -c "import json,sys; n='polymm-${d#data_mm_}'; print(next((p['pm2_env']['status'] for p in json.load(sys.stdin) if p['name']==n),'нет'))")

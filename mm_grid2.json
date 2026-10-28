@@ -1,0 +1,30 @@
+{
+  "base": "mm_fastfeed.json",
+  "variants": [
+    {
+      "name": "f96",
+      "edge": 0.04,
+      "out": "data_mmg2_96"
+    },
+    {
+      "name": "f90",
+      "edge": 0.1,
+      "out": "data_mmg2_90"
+    },
+    {
+      "name": "f84",
+      "edge": 0.16,
+      "out": "data_mmg2_84"
+    },
+    {
+      "name": "f80",
+      "edge": 0.2,
+      "out": "data_mmg2_80"
+    },
+    {
+      "name": "f74",
+      "edge": 0.26,
+      "out": "data_mmg2_74"
+    }
+  ]
+}
