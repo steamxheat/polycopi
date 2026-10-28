@@ -320,6 +320,7 @@ class Engine:
         self.seen: set[str] = set()
         self._seen_q: deque = deque()
         self.leader_net: dict[tuple, float] = {}
+        self.leader_net_ts: dict[tuple, float] = {}
         self.recent_group: dict[tuple, float] = {}
         self.end_cache: dict[str, float] = {}
         self.resolve_next: dict[str, float] = {}
@@ -380,6 +381,9 @@ class Engine:
             del self.recent_group[g]
         for slug in [s for s, e in self.end_cache.items() if e < now - 86400]:
             del self.end_cache[slug]
+        for nk in [k for k, ts in self.leader_net_ts.items() if ts < now - 86400]:
+            self.leader_net.pop(nk, None)
+            self.leader_net_ts.pop(nk, None)
 
     def save_state(self):
         self.prune()
@@ -439,7 +443,7 @@ class Engine:
             return False
         self.seen.add(t.key)
         self._seen_q.append(t.key)
-        if len(self._seen_q) > 200000:
+        if len(self._seen_q) > 50000:
             self.seen.discard(self._seen_q.popleft())
         return True
 
@@ -472,6 +476,7 @@ class Engine:
         nk = (t.wallet, t.asset)
         held_before = self.leader_net.get(nk, 0.0)
         self.leader_net[nk] = held_before + (t.size if t.side == "BUY" else -t.size)
+        self.leader_net_ts[nk] = self.api.now()
 
         self.debug(f"FILL  {name} [{source}] {t.side} {t.outcome} @{t.price} x{t.size:g} "
                    f"(${t.usdc:.2f}, fee_coef {'' if fc is None else f'{fc:.3f}'}) "
@@ -729,8 +734,23 @@ class Engine:
                   + (f", запрос опроса медиана {statistics.median(self.poll_ms):.0f} мс, "
                      f"90% {sorted(self.poll_ms)[int(len(self.poll_ms) * .9)]:.0f} мс"
                      if self.poll_ms else ""))
+        self.info(self.mem_line())
         for line in self.status_lines():
             self.info(line)
+
+    def mem_line(self) -> str:
+        """Сколько занимает бот и что внутри копится — чтобы ловить утечки памяти."""
+        try:
+            with open("/proc/self/statm") as f:
+                rss = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+            rss_s = f"{rss:.0f} МБ"
+        except (OSError, ValueError, IndexError):
+            rss_s = "?"
+        pos = sum(len(lb.real.positions) + len(lb.ideal.positions) for lb in self.leaders.values())
+        st = sum(len(v) for lb in self.leaders.values() for v in lb.stats.values())
+        return (f"ПАМЯТЬ {rss_s}: seen {len(self.seen)}, leader_net {len(self.leader_net)}, "
+                f"recent_group {len(self.recent_group)}, end_cache {len(self.end_cache)}, "
+                f"resolve {len(self.resolve_tries)}, позиций {pos}, stats {st}")
 
 
 # ======================================================================= FEEDS
