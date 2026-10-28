@@ -177,6 +177,21 @@ class SurvivalTests(unittest.TestCase):
             w.resolve_pending()
         self.assertEqual(w.surv[0][1], [1] * len(HORIZONS_MS))
 
+    def test_new_price_triggers_check(self):
+        """Сигнал должен появляться на новой цене, не дожидаясь цикла."""
+        w, api, mk = mkw(self.tmp, lead_sources=None, move_bps=3.0, ask_stale_s=1.0)
+        api.t = mk.start + 60
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t - 2)
+        sym = w.cfg["assets"]["btc"]
+        w.prices.on_add = None                        # заполняем прошлое без триггера
+        w.prices.add(sym, api.t - 2.0, 100.0, "s0")
+        w.prices.on_add = w._on_price
+        self.assertEqual(len(w.pending), 0)
+        w.prices.add(sym, api.t, 100.06, "s0")        # рывок +6 б.п. -> сигнал сразу
+        self.assertEqual(len(w.pending), 1)
+        self.assertGreaterEqual(w.counters["fast_trigger"], 1)
+
     def test_signal_not_repeated_within_gap(self):
         w, api, _ = self.arm(signal_gap_s=5.0)
         w.check_signals()

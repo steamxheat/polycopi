@@ -54,7 +54,8 @@ DEFAULTS = {
     "max_price": 0.95,
     "signal_gap_s": 5.0,        # не брать один и тот же токен чаще, чем раз в N с
     "rest_every_s": 2.0,        # как часто сверять REST с живой лентой
-    "loop_s": 0.05,
+    "loop_s": 0.02,
+    "trigger_gap_s": 0.01,      # не чаще раза в 10 мс (цены приходят пачками)
     "status_every_s": 60,
     "min_tau": 8,
     "ws_silence_s": 10,
@@ -110,6 +111,9 @@ class Watcher:
         self.tok_mkt: dict[str, fvsim.Mkt] = {}
         self.book = TrackedBook(self.on_ask_change)
         self.prices = PriceFeed(list(cfg["assets"].values()), keep_s=60)
+        # как у бота: решаем на КАЖДОЙ новой цене, иначе короткие рывки проходят мимо
+        self._last_trig = 0.0
+        self.prices.on_add = self._on_price
         self.counters: dict[str, int] = defaultdict(int)
         self.ws_last = 0.0
         self.open_level: dict[str, tuple] = {}        # tok -> (цена, когда появилась, рывок)
@@ -163,6 +167,19 @@ class Watcher:
         sgn = 1 if side == "Up" else -1
         need = self.cfg.get("lead_agree", 1)
         return sum(1 for x in self.rets(asset) if sgn * x >= self.cfg["move_bps"]) >= need
+
+    def _on_price(self, symbol: str, ts: float) -> None:
+        """Новая цена с быстрой биржи — сразу проверяем условие и горизонты."""
+        now = self.api.now()
+        if now - self._last_trig < self.cfg["trigger_gap_s"]:
+            return
+        self._last_trig = now
+        self.count("fast_trigger")
+        try:
+            self.check_signals()
+            self.resolve_pending()
+        except Exception as e:  # noqa: BLE001
+            log.debug(f"быстрая проверка: {e}")
 
     # ------------------------------------------------- 1) время жизни лучшего аска
     def on_ask_change(self, tok, prev, new, now):
