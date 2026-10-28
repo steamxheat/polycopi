@@ -123,5 +123,8 @@
    "max_ask": 0.985,
    "max_tau": 120
   }
- ]
+ ],
+ "use_binance_ws": false,
+ "use_bybit_perp_ws": true,
+ "use_okx_perp_ws": true
 }
