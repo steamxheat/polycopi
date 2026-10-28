@@ -1,0 +1,85 @@
+{
+  "variants": [
+    {
+      "name": "e4-early",
+      "min_edge": 0.04,
+      "min_tau": 90
+    },
+    {
+      "name": "e3-early",
+      "min_edge": 0.03,
+      "min_tau": 90
+    },
+    {
+      "name": "e5-early",
+      "min_edge": 0.05,
+      "min_tau": 90
+    },
+    {
+      "name": "e4-6-early",
+      "min_edge": 0.04,
+      "max_edge": 0.06,
+      "min_tau": 90
+    },
+    {
+      "name": "e4-8-early",
+      "min_edge": 0.04,
+      "max_edge": 0.08,
+      "min_tau": 90
+    },
+    {
+      "name": "e4-early120",
+      "min_edge": 0.04,
+      "min_tau": 120
+    },
+    {
+      "name": "e4-early180",
+      "min_edge": 0.04,
+      "min_tau": 180
+    },
+    {
+      "name": "e4-early-btc",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "assets": [
+        "btc"
+      ]
+    },
+    {
+      "name": "e4-early-eth",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "assets": [
+        "eth"
+      ]
+    },
+    {
+      "name": "e4-early-fav",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "min_p": 0.5
+    },
+    {
+      "name": "e4-early-dog",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "max_p": 0.5
+    },
+    {
+      "name": "e4-early-5m",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "windows": [
+        "5m"
+      ]
+    },
+    {
+      "name": "e4-early-15m",
+      "min_edge": 0.04,
+      "min_tau": 90,
+      "windows": [
+        "15m"
+      ]
+    }
+  ]
+}

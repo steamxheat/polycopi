@@ -425,7 +425,11 @@ class Engine:
                         continue
                     p = pr[rule] if side == "Up" else 1 - pr[rule]
                     edge = p - ask - f_ask
-                    if edge < sp["min_edge"]:
+                    if edge < sp["min_edge"] or edge > sp.get("max_edge", 9):
+                        continue
+                    if "assets" in sp and m.asset not in sp["assets"]:
+                        continue
+                    if "windows" in sp and m.window not in sp["windows"]:
                         continue
                     if not (sp.get("min_p", 0) <= p <= sp.get("max_p", 1)):
                         continue
