@@ -262,7 +262,7 @@ class Variant:
 
 TRADE_COLS = ["time_utc", "variant", "rule", "asset", "window", "slug", "side", "tau", "ratio_bps", "sigma",
               "p_model", "seen_ask", "fill_vwap", "shares", "cost", "fee", "edge_seen", "edge_fill",
-              "book_ms", "sources"]
+              "book_ms", "sources", "book_age_ms"]
 SNAP_COLS = ["t", "asset", "window", "slug", "tau", "ratio_bps", "sigma", "p_spot", "p_t60", "p_wt",
              "up_bid", "up_ask", "down_bid", "down_ask", "sources"]
 OUT_COLS = ["slug", "asset", "window", "start", "winner", "d_spot_bps", "d_t60_bps", "d_wt_bps"]
@@ -517,6 +517,11 @@ class Engine:
                 log.debug(f"book {tok[:10]}: {e}")
                 return
             ms = (time.perf_counter() - t0) * 1000
+            # насколько свежий стакан нам отдал Polymarket (его метка времени против наших часов)
+            try:
+                age = round(self.api.now() * 1000 - float(bk.get("timestamp")))
+            except (TypeError, ValueError):
+                age = ""
             limit = min(ask + cfg["fill_tolerance"], cfg["max_price"])
             for v, p, edge in items:
                 shares = max(5.0, cfg["stake_usd"] / ask)
@@ -548,7 +553,7 @@ class Engine:
                     "ratio_bps": round((r - 1) * 1e4, 2), "sigma": f"{sig:.3e}", "p_model": round(p, 4),
                     "seen_ask": ask, "fill_vwap": round(f.vwap, 4), "shares": round(f.shares, 2),
                     "cost": round(cost, 4), "fee": round(f.fee, 4), "edge_seen": round(edge, 4),
-                    "edge_fill": round(ef, 4), "book_ms": round(ms), "sources": nsrc})
+                    "edge_fill": round(ef, 4), "book_ms": round(ms), "sources": nsrc, "book_age_ms": age})
                 self.info(f"BUY {v.name:<12} {m.asset.upper()} {m.window} {side:<4} модель {p:.2f} "
                           f"видели {ask:.2f} -> взяли {f.vwap:.3f} (перевес {ef * 100:+.1f}¢) | "
                           f"{tau:.0f}с до конца | BTC/ETH {(r - 1) * 1e4:+.1f} б.п. | счёт ${v.cash:.2f}")
