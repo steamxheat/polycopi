@@ -19,3 +19,7 @@ data_mm_wide16/
 data_fv_tune/
 data_mm_wide20/
 data_mm_wide26/
+data_mm_wide32/
+data_mm_wide40/
+data_arb/
+arb_config.json

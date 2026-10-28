@@ -1,0 +1,31 @@
+{
+  "assets": {
+    "btc": "BTCUSDT",
+    "eth": "ETHUSDT"
+  },
+  "start_cash": 100,
+  "shares": 5,
+  "edge": 0.4,
+  "min_mid": 0.2,
+  "max_mid": 0.8,
+  "start_after_s": 5,
+  "stop_new_pairs_before_end_s": 60,
+  "cancel_all_before_end_s": 5,
+  "max_pairs_per_market": 3,
+  "max_open_pairs_per_market": 1,
+  "requote_ticks": 2,
+  "move_window_s": 2,
+  "move_threshold_bps": 2,
+  "book_move_ticks": 4,
+  "book_move_window_s": 2,
+  "book_cooldown_s": 3,
+  "cooldown_after_move_s": 4,
+  "chase_enabled": false,
+  "chase_after_s": 30,
+  "chase_max_total": 0.99,
+  "status_every_s": 60,
+  "fair_mode": "guard",
+  "rule": "t60",
+  "guard_max_dev": 0.05,
+  "move_watch_s": 0.05
+}
