@@ -1761,6 +1761,31 @@ def learn_report(outs: list[Path]) -> str:
         cc = [r for r in comp if r["asset"] == a]
         L.append(f"    {a.upper():<5} ног {len(b):4d} | выигр. {ww / len(b) * 100:3.0f}% | PnL ног "
                  f"{sum(r['pnl'] for r in b):+8.2f}$ | полных пар {len(cc)} (+{sum(r['pnl'] for r in cc):.2f}$)")
+    L.append("")
+    L.append("8) А если сразу докупить вторую ногу по рынку (тейкером, комиссия 0.07·p·(1−p))?")
+    hed = []
+    for r in legs:
+        f = r.get("f") or {}
+        leg = f.get("leg", "Up")
+        other_ask = f.get("d_ask") if leg == "Up" else f.get("u_ask")
+        mine = r["up_price"] if leg == "Up" else r["down_price"]
+        sh = r["up_filled"] if leg == "Up" else r["down_filled"]
+        if other_ask is None or not sh:
+            continue
+        fee = 0.07 * other_ask * (1 - other_ask)
+        hed.append((r, (1 - mine - other_ask - fee) * sh, mine + other_ask))
+    if hed:
+        real = sum(r["pnl"] for r, _, _ in hed)
+        alt = sum(x for _, x, _ in hed)
+        L.append(f"    ног с ценой второй стороны: {len(hed)} | на деле PnL {real:+.2f}$ | "
+                 f"с докупкой {alt:+.2f}$ (в среднем {alt / len(hed):+.3f}$ на ногу)")
+        for lo, hi in ((0, 0.98), (0.98, 1.0), (1.0, 1.03), (1.03, 1.08), (1.08, 9)):
+            b_ = [(r, x) for r, x, tot in hed if lo <= tot < hi]
+            if b_:
+                L.append(f"    сумма пары {lo:.2f}..{min(hi, 9):.2f}: ног {len(b_):3d} | на деле "
+                         f"{sum(r['pnl'] for r, _ in b_):+7.2f}$ | с докупкой {sum(x for _, x in b_):+7.2f}$")
+    else:
+        L.append("    (нет данных о цене второй стороны)")
     if len(legs) < 200:
         L.append("")
         L.append(f"⚠️ Ног пока {len(legs)} — выводы ненадёжны, нужно хотя бы 200–300.")
