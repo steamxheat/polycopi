@@ -1097,7 +1097,8 @@ async def clob_ws_loop(eng: Engine, stop: asyncio.Event):
         backoff = min(backoff * 2, 30)
 
 
-RTDS_SYMBOL = {"btcusdt": "BTCUSDT", "ethusdt": "ETHUSDT", "solusdt": "SOLUSDT", "xrpusdt": "XRPUSDT"}
+RTDS_SYMBOL = {"btcusdt": "BTCUSDT", "ethusdt": "ETHUSDT", "solusdt": "SOLUSDT", "xrpusdt": "XRPUSDT",
+               "dogeusdt": "DOGEUSDT", "bnbusdt": "BNBUSDT"}
 
 
 def parse_rtds_price(msg: dict):
@@ -1167,8 +1168,10 @@ async def rtds_price_loop(eng: Engine, stop: asyncio.Event):
         backoff = min(backoff * 2, 30)
 
 
-CB_PRODUCT = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD"}
-OKX_INST = {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT", "SOLUSDT": "SOL-USDT", "XRPUSDT": "XRP-USDT"}
+CB_PRODUCT = {"BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD", "SOLUSDT": "SOL-USD", "XRPUSDT": "XRP-USD",
+              "DOGEUSDT": "DOGE-USD"}
+OKX_INST = {"BTCUSDT": "BTC-USDT", "ETHUSDT": "ETH-USDT", "SOLUSDT": "SOL-USDT", "XRPUSDT": "XRP-USDT",
+            "DOGEUSDT": "DOGE-USDT", "BNBUSDT": "BNB-USDT"}
 
 
 def parse_coinbase(msg: dict):

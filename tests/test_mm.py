@@ -486,7 +486,7 @@ class RtdsPriceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap[-1], ("ETHUSDT", 2301.5, 2))
         self.assertEqual(mmsim.parse_rtds_price({"topic": "activity", "payload": {}}), [])
         self.assertEqual(mmsim.parse_rtds_price({"topic": "crypto_prices",
-                                                 "payload": {"symbol": "dogeusdt", "value": 1}}), [])
+                                                 "payload": {"symbol": "shibusdt", "value": 1}}), [])
 
     async def test_rtds_loop_feeds_prices(self):
         got = {}
