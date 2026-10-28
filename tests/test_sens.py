@@ -1,0 +1,69 @@
+import csv
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import sens  # noqa: E402
+
+
+def write(d: Path, trades, outcomes):
+    with (d / "outcomes.csv").open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["slug", "winner"])
+        w.writerows(outcomes)
+    cols = ["variant", "slug", "side", "shares", "fill_vwap", "edge_fill"]
+    with (d / "trades.csv").open("w", newline="") as fh:
+        w = csv.DictWriter(fh, cols)
+        w.writeheader()
+        w.writerows(trades)
+
+
+class SensTests(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_pnl_and_slip(self):
+        ts = [{"shares": 10, "vwap": 0.90, "win": True, "edge": 0.01}]
+        tot, roi, wins = sens.pnl(ts, 0.0)
+        self.assertAlmostEqual(tot, 10 - (9.0 + 0.07 * 0.9 * 0.1 * 10), places=6)
+        self.assertEqual(wins, 1)
+        worse, _, _ = sens.pnl(ts, 0.02)          # цена хуже -> прибыль меньше
+        self.assertLess(worse, tot)
+
+    def test_drop_best_removes_top_edge(self):
+        ts = [{"edge": e} for e in (0.05, 0.01, 0.03, 0.02)]
+        kept = sens.drop_best(ts, 0.25)
+        self.assertEqual(len(kept), 3)
+        self.assertNotIn(0.05, [t["edge"] for t in kept])
+        self.assertEqual(sens.drop_best(ts, 0.0), ts)
+
+    def test_load_skips_unsettled_and_report(self):
+        outcomes = [[f"s{i}", "Up"] for i in range(40)] + [["sX", ""]]
+        trades = [{"variant": "A", "slug": f"s{i}", "side": "Up", "shares": 10,
+                   "fill_vwap": 0.80, "edge_fill": 0.01 * (i % 5)} for i in range(40)]
+        trades.append({"variant": "A", "slug": "sX", "side": "Up", "shares": 10,
+                       "fill_vwap": 0.80, "edge_fill": 0.9})     # окно не рассчитано
+        write(self.d, trades, outcomes)
+        self.assertEqual(len(sens.load(self.d)["A"]), 40)
+        txt = sens.report(self.d, min_n=30)
+        self.assertIn("A: 40 сделок", txt)
+        self.assertIn("ЗАПАС ЕСТЬ", txt)
+
+    def test_losing_variant_marked(self):
+        outcomes = [[f"s{i}", "Up" if i % 2 else "Down"] for i in range(40)]
+        trades = [{"variant": "B", "slug": f"s{i}", "side": "Up", "shares": 10,
+                   "fill_vwap": 0.80, "edge_fill": 0.01} for i in range(40)]
+        write(self.d, trades, outcomes)
+        self.assertIn("НЕ ДЕРЖИТСЯ", sens.report(self.d, min_n=30))
+
+
+if __name__ == "__main__":
+    unittest.main()
