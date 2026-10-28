@@ -1,0 +1,246 @@
+import csv
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import fillcheck  # noqa: E402
+from fillcheck import HORIZONS_MS, Watcher  # noqa: E402
+
+
+class FakeApi:
+    def __init__(self, t=1000.0):
+        self.t = t
+        self.books = {}
+
+    def now(self):
+        return self.t
+
+    async def get_book(self, tok):
+        return self.books.get(tok, {})
+
+    async def get_market(self, slug):
+        return None
+
+
+def mkw(tmp, **over):
+    cfg = dict(fillcheck.DEFAULTS)
+    cfg.update(over)
+    api = FakeApi()
+    w = Watcher(cfg, api, tmp)
+    mk = fillcheck.fvsim.Mkt("btc-updown-5m-900", "btc", "5m", 900, 1200, "U", "D")
+    w.markets[mk.slug] = mk
+    w.tok_mkt["U"] = w.tok_mkt["D"] = mk
+    return w, api, mk
+
+
+def feed(w, api, *bps):
+    """Кладёт в ленту цены так, чтобы движение за секунду было ровно bps."""
+    sym = w.cfg["assets"]["btc"]
+    for i, b in enumerate(bps):
+        src = f"s{i}"
+        # цена ДО окна замера (нужна как точка отсчёта) и цена сейчас
+        w.prices.add(sym, api.t - 2.0, 100.0, src)
+        w.prices.add(sym, api.t, 100.0 * (1 + b / 1e4), src)
+
+
+class MoveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_move_direction_matters(self):
+        w, api, _ = mkw(self.tmp, lead_sources=None, lead_agree=1, move_bps=3.0)
+        feed(w, api, 5.0)                        # цена ушла ВВЕРХ на 5 б.п.
+        self.assertTrue(w.moved("btc", "Up"))
+        self.assertFalse(w.moved("btc", "Down"))
+        self.assertAlmostEqual(w.move_bps("btc"), 5.0, places=1)
+
+    def test_move_needs_enough_sources(self):
+        w, api, _ = mkw(self.tmp, lead_sources=None, lead_agree=2, move_bps=3.0)
+        feed(w, api, 5.0, 0.0)                   # согласен только один источник
+        self.assertFalse(w.moved("btc", "Up"))
+        w2, api2, _ = mkw(self.tmp, lead_sources=None, lead_agree=2, move_bps=3.0)
+        feed(w2, api2, 5.0, 4.0)
+        self.assertTrue(w2.moved("btc", "Up"))
+
+    def test_small_move_ignored(self):
+        w, api, _ = mkw(self.tmp, lead_sources=None, move_bps=3.0)
+        feed(w, api, 1.0)
+        self.assertFalse(w.moved("btc", "Up"))
+
+
+class LifetimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_level_lifetime_measured(self):
+        w, api, _ = mkw(self.tmp)
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        api.t += 0.35                                   # заявка простояла 350 мс
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.62", "size": "10"}]}, api.t)
+        self.assertEqual(len(w.lives), 1)
+        life, after = w.lives[0]
+        self.assertAlmostEqual(life, 350, delta=1)
+        self.assertFalse(after)                         # рывка не было
+        rs = fillcheck.rows(self.tmp / "levels.csv")
+        self.assertEqual(rs[0]["price"], "0.6")
+        self.assertEqual(rs[0]["after_move"], "0")
+
+    def test_level_marked_after_move(self):
+        w, api, _ = mkw(self.tmp, lead_sources=None, move_bps=3.0)
+        feed(w, api, 6.0)
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        api.t += 0.1
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.61", "size": "10"}]}, api.t)
+        self.assertTrue(w.lives[0][1])                  # уровень появился после рывка
+
+    def test_unknown_token_not_tracked(self):
+        w, api, _ = mkw(self.tmp)
+        w.book.on_event({"event_type": "book", "asset_id": "ZZZ",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        self.assertNotIn("ZZZ", w.open_level)
+
+
+class SurvivalTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def arm(self, **over):
+        w, api, mk = mkw(self.tmp, lead_sources=None, move_bps=3.0, ask_stale_s=1.0, **over)
+        api.t = mk.start + 60
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t - 2)
+        feed(w, api, 6.0)
+        return w, api, mk
+
+    def test_signal_requires_stale_ask(self):
+        w, api, mk = self.arm()
+        w.book._set("U", None, 0.61, api.t)             # аск только что переставили
+        self.assertAlmostEqual(w.book.ask_t["U"], api.t)
+        w.check_signals()
+        self.assertEqual(len(w.pending), 0)
+
+    def test_price_survives_all_horizons(self):
+        w, api, _ = self.arm()
+        w.check_signals()
+        self.assertEqual(len(w.pending), 1)
+        for _ in range(40):                             # цена не меняется
+            api.t += 0.05
+            w.resolve_pending()
+        self.assertEqual(len(w.surv), 1)
+        ask0, oks = w.surv[0]
+        self.assertAlmostEqual(ask0, 0.60)
+        self.assertEqual(oks, [1] * len(HORIZONS_MS))
+
+    def test_price_taken_after_120ms(self):
+        w, api, _ = self.arm()
+        w.check_signals()
+        api.t += 0.12
+        w.resolve_pending()                             # 50 и 100 мс — успели
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.70", "size": "10"}]}, api.t)
+        for _ in range(30):
+            api.t += 0.05
+            w.resolve_pending()
+        _, oks = w.surv[0]
+        by = dict(zip(HORIZONS_MS, oks))
+        self.assertEqual((by[50], by[100]), (1, 1))
+        self.assertEqual((by[200], by[500], by[1000]), (0, 0, 0))
+        r = fillcheck.rows(self.tmp / "survive.csv")[0]
+        self.assertEqual((r["ok_100"], r["ok_200"], r["side"]), ("1", "0", "Up"))
+
+    def test_better_price_counts_as_filled(self):
+        w, api, _ = self.arm()
+        w.check_signals()
+        api.t += 0.06
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.55", "size": "10"}]}, api.t)   # стало дешевле
+        for _ in range(30):
+            api.t += 0.05
+            w.resolve_pending()
+        self.assertEqual(w.surv[0][1], [1] * len(HORIZONS_MS))
+
+    def test_signal_not_repeated_within_gap(self):
+        w, api, _ = self.arm(signal_gap_s=5.0)
+        w.check_signals()
+        api.t += 0.5
+        feed(w, api, 6.0)
+        w.check_signals()
+        self.assertEqual(len(w.pending) + len(w.surv), 1)
+
+
+class GhostTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_ghost_detected_when_rest_cheaper(self):
+        w, api, _ = mkw(self.tmp)
+        w.book._set("U", None, 0.70, api.t)                       # живой стакан: 70¢
+        api.books["U"] = {"asks": [{"price": "0.60", "size": "10"}],
+                          "timestamp": str(int(api.t * 1000) - 1500)}
+        await w.check_rest()
+        self.assertEqual((w.rest_n, w.ghost_n), (1, 1))
+        r = fillcheck.rows(self.tmp / "ghosts.csv")[0]
+        self.assertEqual(r["ghost"], "1")
+        self.assertAlmostEqual(float(r["diff_c"]), 10.0, places=1)
+        self.assertAlmostEqual(float(r["rest_age_ms"]), 1500, delta=2)
+
+    async def test_no_ghost_when_rest_matches(self):
+        w, api, _ = mkw(self.tmp)
+        w.book._set("U", None, 0.60, api.t)
+        api.books["U"] = {"asks": [{"price": "0.60", "size": "10"}],
+                          "timestamp": str(int(api.t * 1000))}
+        await w.check_rest()
+        self.assertEqual((w.rest_n, w.ghost_n), (1, 0))
+
+    async def test_report_runs(self):
+        w, api, _ = mkw(self.tmp)
+        w.book._set("U", None, 0.70, api.t)
+        api.books["U"] = {"asks": [{"price": "0.60", "size": "10"}],
+                          "timestamp": str(int(api.t * 1000))}
+        await w.check_rest()
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        api.t += 0.2
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.62", "size": "10"}]}, api.t)
+        txt = fillcheck.report(self.tmp)
+        self.assertIn("СКОЛЬКО ЖИВЁТ", txt)
+        self.assertIn("ПРИЗРАКИ", txt)
+        w.status()
+
+    async def test_report_without_data(self):
+        self.assertIn("Нет данных", fillcheck.report(self.tmp))
+
+
+class PctTests(unittest.TestCase):
+    def test_pct(self):
+        xs = list(range(1, 101))
+        self.assertEqual(fillcheck.pct(xs, 0), 1)
+        self.assertEqual(fillcheck.pct(xs, 100), 100)
+        self.assertEqual(fillcheck.pct([], 50), 0.0)
+        self.assertTrue(40 <= fillcheck.pct(xs, 50) <= 60)
+
+
+if __name__ == "__main__":
+    unittest.main()
