@@ -1,4 +1,5 @@
 import csv
+import json
 import shutil
 import sys
 import tempfile
@@ -75,6 +76,38 @@ class SensTests(unittest.TestCase):
         self.assertIn("A: 40 сделок", txt)
         self.assertIn("Прошли проверку на значимость: 1 из 1", txt)
         self.assertNotIn("шум", txt)
+
+    def test_state_json_is_preferred_and_full(self):
+        """В trades.csv только часть истории, в state.json — вся. Берём вторую."""
+        outcomes = [[f"s{i}", "Up"] for i in range(5)]
+        trades = [{"variant": "A", "slug": f"s{i}", "side": "Up", "shares": 10,
+                   "fill_vwap": 0.80, "edge_fill": 0.01,
+                   "time_utc": f"2026-10-28T{i:02d}:00:00"} for i in range(5)]
+        write(self.d, trades, outcomes)
+        st = {"variants": {"A": {"trades": [
+            {"slug": f"s{i}", "tok": "T", "side": "Up", "t": 1000.0 + i, "shares": 10,
+             "vwap": 0.80, "cost": 8.1, "edge_fill": 0.01, "pnl": 1.9, "won": True}
+            for i in range(40)] + [
+            {"slug": "sOpen", "tok": "T", "side": "Up", "t": 2000.0, "shares": 10,
+             "vwap": 0.80, "cost": 8.1, "edge_fill": 0.01, "pnl": None, "won": False}]}}}
+        (self.d / "state.json").write_text(json.dumps(st))
+        self.assertEqual(len(sens.load_state(self.d)["A"]), 40)   # нерассчитанная пропущена
+        self.assertEqual(len(sens.load(self.d)["A"]), 5)
+        txt = sens.report(self.d, min_n=30)
+        self.assertIn("state.json", txt)
+        self.assertIn("A: 40 сделок", txt)
+        csv_txt = sens.report(self.d, min_n=3, source="csv")
+        self.assertIn("trades.csv", csv_txt)
+        self.assertIn("A: 5 сделок", csv_txt)
+
+    def test_state_json_missing_falls_back_to_csv(self):
+        outcomes = [[f"s{i}", "Up"] for i in range(40)]
+        trades = [{"variant": "A", "slug": f"s{i}", "side": "Up", "shares": 10,
+                   "fill_vwap": 0.80, "edge_fill": 0.01,
+                   "time_utc": f"2026-10-28T{i // 2:02d}:00:00"} for i in range(40)]
+        write(self.d, trades, outcomes)
+        self.assertEqual(sens.load_state(self.d), {})
+        self.assertIn("trades.csv", sens.report(self.d, min_n=30))
 
     def test_losing_variant_marked(self):
         outcomes = [[f"s{i}", "Up" if i % 2 else "Down"] for i in range(40)]

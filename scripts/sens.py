@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import statistics
 from pathlib import Path
@@ -26,6 +27,28 @@ FEE_COEF = 0.07
 
 def fee(p: float, shares: float) -> float:
     return FEE_COEF * p * (1 - p) * shares
+
+
+def load_state(d: Path):
+    """Полная история сделок из state.json бота (включая те, что были до смены
+    формата trades.csv — тот файл бот отложил в trades_old_*.csv)."""
+    sp = d / "state.json"
+    if not sp.exists():
+        return {}
+    st = json.loads(sp.read_text())
+    out: dict[str, list[dict]] = {}
+    for name, v in st.get("variants", {}).items():
+        for t in v.get("trades", []):
+            if t.get("pnl") is None:
+                continue                       # окно ещё не рассчитано
+            try:
+                out.setdefault(name, []).append(
+                    {"v": name, "shares": float(t["shares"]), "vwap": float(t["vwap"]),
+                     "win": bool(t.get("won")), "edge": float(t.get("edge_fill") or 0.0),
+                     "t": f"{float(t['t']):.3f}"})
+            except (TypeError, ValueError, KeyError):
+                continue
+    return out
 
 
 def load(d: Path):
@@ -120,8 +143,12 @@ def drop_best(ts: list[dict], frac: float):
     return s[int(len(s) * frac):]
 
 
-def report(d: Path, min_n: int) -> str:
-    trades = load(d)
+def report(d: Path, min_n: int, source: str = "auto") -> str:
+    trades, src = {}, ""
+    if source in ("auto", "state"):
+        trades, src = load_state(d), "state.json (полная история)"
+    if not trades and source in ("auto", "csv"):
+        trades, src = load(d), "trades.csv (только после последней смены формата)"
     if not trades:
         return f"Нет рассчитанных сделок в {d}"
     big = {v: ts for v, ts in trades.items() if len(ts) >= min_n}
@@ -129,6 +156,7 @@ def report(d: Path, min_n: int) -> str:
     slips = (0.0, 0.01, 0.02)
     drops = (0.0, 0.25, 0.50)
     L = [f"=== Чувствительность и значимость: {d} ===",
+         f"Источник: {src}",
          f"Вариантов всего {len(trades)}, из них с ≥{min_n} сделок — {len(big)}.",
          "",
          "ЧАСТЬ 1. Это вообще не случайность?",
@@ -193,8 +221,10 @@ def main():
     ap = argparse.ArgumentParser(description="Чувствительность результатов тейкера к цене и конкуренции")
     ap.add_argument("data", nargs="?", default="data_fv_lag")
     ap.add_argument("--min-n", type=int, default=30)
+    ap.add_argument("--source", choices=("auto", "state", "csv"), default="auto",
+                    help="state.json — вся история; csv — только текущий trades.csv")
     a = ap.parse_args()
-    print(report(Path(a.data), a.min_n))
+    print(report(Path(a.data), a.min_n, a.source))
 
 
 if __name__ == "__main__":
