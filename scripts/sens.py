@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import math
 import statistics
 from pathlib import Path
@@ -111,11 +112,31 @@ def zscore(xs: list[float]) -> float:
     return m / (sd / math.sqrt(n))
 
 
-def z_threshold(k: int) -> float:
-    """Порог z с поправкой на перебор k вариантов: при k вариантах самый удачливый
-    почти всегда даёт z около 2 просто так. Грубая, но честная поправка."""
-    k = max(1, k)
-    return 2.0 + 0.55 * math.log(k)
+def eff_k(trades: dict[str, list[dict]]) -> float:
+    """Сколько НЕЗАВИСИМЫХ проверок мы на самом деле сделали.
+
+    Варианты торгуют во многом одни и те же сделки, поэтому 16 вариантов — это не
+    16 независимых экспериментов. Оцениваем по пересечению сделок: если все варианты
+    торгуют одно и то же, независимая проверка одна.
+    """
+    vs = list(trades.values())
+    if len(vs) < 2:
+        return float(len(vs) or 1)
+    keys = [{(t["t"], round(t["vwap"], 4)) for t in ts} for ts in vs]
+    sims = []
+    for i in range(len(keys)):
+        for j in range(i + 1, len(keys)):
+            u = len(keys[i] | keys[j])
+            sims.append(len(keys[i] & keys[j]) / u if u else 0.0)
+    overlap = statistics.mean(sims) if sims else 0.0
+    return max(1.0, len(vs) * (1 - overlap))
+
+
+def z_threshold(k: float) -> float:
+    """Порог z с поправкой на перебор k НЕЗАВИСИМЫХ проверок.
+    При одной проверке — обычные 2.0; дальше поправка Бонферрони, но мягкая,
+    потому что k уже уменьшено на пересечение сделок между вариантами."""
+    return 2.0 + 0.55 * math.log(max(1.0, k))
 
 
 def top_share(xs: list[float], m: int = 3) -> float:
@@ -152,22 +173,27 @@ def report(d: Path, min_n: int, source: str = "auto") -> str:
     if not trades:
         return f"Нет рассчитанных сделок в {d}"
     big = {v: ts for v, ts in trades.items() if len(ts) >= min_n}
-    thr = z_threshold(len(trades))
+    k = eff_k(trades)
+    thr = z_threshold(k)
+    span = hours(d)
     slips = (0.0, 0.01, 0.02)
     drops = (0.0, 0.25, 0.50)
     L = [f"=== Чувствительность и значимость: {d} ===",
          f"Источник: {src}",
-         f"Вариантов всего {len(trades)}, из них с ≥{min_n} сделок — {len(big)}.",
+         f"Вариантов всего {len(trades)}, из них с ≥{min_n} сделок — {len(big)}."
+         + (f" Бот работает {span:.1f} ч." if span else ""),
          "",
          "ЧАСТЬ 1. Это вообще не случайность?",
          "  z — во сколько раз средний результат больше своей погрешности.",
-         f"  Мы перебрали {len(trades)} вариантов, поэтому порог поднят до z ≥ {thr:.1f}:",
-         "  при таком переборе самый удачливый вариант даёт z около 2 просто по удаче.",
+         f"  Вариантов {len(trades)}, но они торгуют во многом одни и те же сделки,",
+         f"  поэтому независимых проверок всего ~{k:.1f} -> порог z ≥ {thr:.1f}",
+         "  (при одной проверке хватило бы 2.0; поправка нужна из-за перебора).",
+         "  «нужно сделок» — сколько их нужно для порога, если эффект того же размера.",
          "  «топ-3» — какую долю плюса дают три самых крупных выигрыша.",
          "  «половины» — результат первой и второй половины сделок по времени.",
          "",
          f"{'вариант':<20} {'сделок':>6} {'PnL $':>8} {'z':>6} {'топ-3':>7} "
-         f"{'1-я пол.':>10} {'2-я пол.':>10}  вывод"]
+         f"{'1-я пол.':>10} {'2-я пол.':>10} {'нужно':>7} {'ещё':>8}  вывод"]
     proven = []
     for v in sorted(big):
         ts = big[v]
@@ -177,9 +203,19 @@ def report(d: Path, min_n: int, source: str = "auto") -> str:
         ok = z >= thr and h1 > 0 and h2 > 0
         if ok:
             proven.append(v)
+        need = len(ts) * (thr / z) ** 2 if z > 0 else 0
+        nd = f"{need:,.0f}".replace(",", " ") if 0 < need < 1e5 else ("-" if z <= 0 else "много")
+        eta = (f"{(need - len(ts)) / (len(ts) / span):.0f} ч"
+               if span and z > 0 and 0 < need < 1e5 and need > len(ts) else "-")
+        verdict = ("доказано" if ok else
+                   "похоже на правду, не доказано" if z >= 2.0 and h1 > 0 and h2 > 0 else
+                   "шум, не доказано")
         L.append(f"{v:<20} {len(ts):>6} {sum(xs):>+8.1f} {z:>6.1f} {top_share(xs):>6.0f}% "
-                 f"{h1:>+10.1f} {h2:>+10.1f}  {'доказано' if ok else 'шум, не доказано'}")
-    L += ["", f"Прошли проверку на значимость: {len(proven)} из {len(big)}.", ""]
+                 f"{h1:>+10.1f} {h2:>+10.1f} {nd:>7} {eta:>8}  {verdict}")
+    pos = sum(1 for ts in big.values() if sum(each_pnl(ts)) > 0)
+    L += ["", f"Прошли проверку на значимость: {len(proven)} из {len(big)}.",
+          f"В плюсе: {pos} из {len(big)}. Если бы это была чистая случайность, "
+          f"ожидалось бы около половины.", ""]
     if not proven:
         L += ["Ни один вариант не доказал преимущества. Плюс у лучших объясняется",
               "тем, что вариантов много и сделок мало. Реальные деньги ставить нельзя —",
@@ -217,6 +253,14 @@ def report(d: Path, min_n: int, source: str = "auto") -> str:
     return "\n".join(L)
 
 
+def hours(d: Path) -> float:
+    try:
+        st = json.loads((d / "state.json").read_text())
+        return max((st["saved"] - st["started"]) / 3600, 0.0)
+    except (OSError, ValueError, KeyError):
+        return 0.0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Чувствительность результатов тейкера к цене и конкуренции")
     ap.add_argument("data", nargs="?", default="data_fv_lag")
@@ -224,7 +268,10 @@ def main():
     ap.add_argument("--source", choices=("auto", "state", "csv"), default="auto",
                     help="state.json — вся история; csv — только текущий trades.csv")
     a = ap.parse_args()
-    print(report(Path(a.data), a.min_n, a.source))
+    try:
+        print(report(Path(a.data), a.min_n, a.source))
+    except BrokenPipeError:            # вывод обрезали через | head — это не ошибка
+        os._exit(0)
 
 
 if __name__ == "__main__":

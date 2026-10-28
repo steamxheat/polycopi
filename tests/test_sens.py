@@ -52,6 +52,14 @@ class SensTests(unittest.TestCase):
         self.assertAlmostEqual(sens.zscore([1, -1] * 50), 0.0)
         self.assertGreater(sens.z_threshold(16), sens.z_threshold(1))   # перебор -> строже
 
+    def test_eff_k_counts_only_independent_variants(self):
+        one = [{"t": "1", "vwap": 0.5}]
+        self.assertEqual(sens.eff_k({"a": one, "b": list(one)}), 1.0)   # то же самое
+        self.assertEqual(sens.eff_k({"a": one, "b": [{"t": "2", "vwap": 0.6}]}), 2.0)
+        self.assertEqual(sens.eff_k({"a": one}), 1.0)
+        self.assertEqual(sens.z_threshold(1), 2.0)
+        self.assertGreater(sens.z_threshold(16), sens.z_threshold(2))
+
     def test_top_share_and_halves(self):
         self.assertAlmostEqual(sens.top_share([10, 1, 1, 1, 1, 1], 3), 80.0)
         self.assertEqual(sens.top_share([-1, -2], 3), 0.0)
