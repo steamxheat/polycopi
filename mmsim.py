@@ -284,6 +284,9 @@ class PriceFeed:
         self.last_update = max(self.last_update, ts)
         self.seen[source] = ts
         self.source = source
+        cb = getattr(self, "on_add", None)
+        if cb is not None:
+            cb(symbol, ts)
 
     def last(self, symbol: str):
         best = None

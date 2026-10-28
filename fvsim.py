@@ -254,6 +254,13 @@ class Engine:
         out.mkdir(parents=True, exist_ok=True)
         self.prices = PriceFeed(list(cfg["assets"].values()))
         self.sampler = Sampler(self.prices)
+        # «запаздывающие» варианты решают сразу на каждой новой цене, не дожидаясь цикла
+        lag = [v for v in cfg["variants"] if "move_bps" in v]
+        if lag:
+            self._trig_bps = min(v["move_bps"] for v in lag)
+            self._trig_s = max(v.get("move_s", 1.0) for v in lag)
+            self._last_trig = 0.0
+            self.prices.on_add = self._on_price
         self.book = Book()
         self.markets: dict[str, Mkt] = {}
         self.variants = {v["name"]: Variant(v, cfg["start_cash"]) for v in cfg["variants"]}
@@ -387,6 +394,19 @@ class Engine:
         return pr, statistics.median(ratios), sig, len(ratios)
 
     # ---- решения
+    def _on_price(self, symbol: str, ts: float):
+        now = self.api.now()
+        if now - self._last_trig < self.cfg.get("trigger_gap_s", 0.02):
+            return
+        mv = self.prices.ret_bps(symbol, now, self._trig_s)
+        if mv is not None and abs(mv) >= self._trig_bps:
+            self._last_trig = now
+            self.count("fast_trigger")
+            try:
+                self.decide()
+            except Exception as e:  # noqa: BLE001
+                log.debug(f"fast decide: {e}")
+
     def decide(self):
         now = self.api.now()
         cfg = self.cfg
