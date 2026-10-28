@@ -179,6 +179,7 @@ class Book:
         self.bid: dict[str, float] = {}
         self.ask: dict[str, float] = {}
         self.t: dict[str, float] = {}
+        self.ask_t: dict[str, float] = {}       # когда лучший аск последний раз менялся
 
     def on_event(self, ev: dict, now: float):
         et = ev.get("event_type")
@@ -204,6 +205,8 @@ class Book:
         if b is not None and b > 0:
             self.bid[tok] = b
         if a is not None and 0 < a < 1:
+            if self.ask.get(tok) != a:
+                self.ask_t[tok] = now
             self.ask[tok] = a
         self.t[tok] = now
 
@@ -431,6 +434,14 @@ class Engine:
                         continue
                     if "windows" in sp and m.window not in sp["windows"]:
                         continue
+                    if "move_bps" in sp:
+                        # «запаздывание»: биржа уже сдвинулась в нашу сторону, а аск на Polymarket ещё нет
+                        sym = cfg["assets"][m.asset]
+                        mv = self.prices.ret_bps(sym, now, sp.get("move_s", 1.0))
+                        if mv is None or (mv if side == "Up" else -mv) < sp["move_bps"]:
+                            continue
+                        if now - self.book.ask_t.get(tok, now) < sp.get("ask_stale_s", 0):
+                            continue
                     if not (sp.get("min_p", 0) <= p <= sp.get("max_p", 1)):
                         continue
                     if tau < sp.get("min_tau", 0) or tau > sp.get("max_tau", 1e9):

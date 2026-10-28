@@ -11,6 +11,10 @@ if [ -f data_fv/state.json ]; then
   echo; echo "=== ТЕЙКЕР (polyfv-sim)"
   python3 fvsim.py report 2>/dev/null | sed -n '1,12p' | grep -vE '^\s*$'
 fi
+if [ -f data_fv_lag/state.json ]; then
+  echo; echo "=== ТЕЙКЕР-ЗАПАЗДЫВАНИЕ (polyfv-lag): биржа уже сдвинулась, Polymarket ещё нет"
+  python3 fvsim.py report --out data_fv_lag 2>/dev/null | sed -n '1,13p' | grep -vE '^\s*$'
+fi
 if [ -f data_fv_tune/state.json ]; then
   echo; echo "=== ТЕЙКЕР-ПОДБОР (polyfv-tune): варианты вокруг edge4-early"
   python3 fvsim.py report --out data_fv_tune 2>/dev/null | sed -n '1,16p' | grep -vE '^\s*$'

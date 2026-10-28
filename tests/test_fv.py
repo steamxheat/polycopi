@@ -167,6 +167,29 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("калибровка", txt)
         self.assertIn("какое правило", txt)
 
+    async def test_lag_variant_needs_fresh_move_and_stale_ask(self):
+        eng, api = make_engine(self.tmp, variants=[
+            {"name": "lag", "min_edge": 0.0, "move_bps": 3, "move_s": 1, "ask_stale_s": 1}])
+        wiggle = lambda t: 100000 * (1 + 2e-5 * math.sin(t))
+        feed(eng, api, START - 10, wiggle)
+        await eng.discover()
+        feed(eng, api, START + 150, lambda t: wiggle(t) if t < START + 100 else 100000 * 1.003)
+        eng.book.on_event({"event_type": "price_change", "price_changes": [
+            {"asset_id": UP, "best_bid": "0.78", "best_ask": "0.80"},
+            {"asset_id": DN, "best_bid": "0.19", "best_ask": "0.21"}]}, api.t - 5)
+        api.books[UP] = book(asks=[(0.80, 100)])
+        # цена давно стоит на месте — рывка нет -> не входим
+        eng.decide()
+        await asyncio.sleep(0.01)
+        self.assertEqual(api.book_calls, 0)
+        # рывок +5 б.п. за секунду, аск Polymarket не менялся 5 с -> входим в Up
+        for src in ("coinbase_ws", "okx_ws"):
+            eng.prices.add("BTCUSDT", api.t, 100000 * 1.0035, src)
+        eng.decide()
+        await asyncio.sleep(0.01)
+        self.assertEqual(api.book_calls, 1)
+        self.assertEqual(eng.variants["lag"].trades[0]["side"], "Up")
+
     async def test_twap_variant_and_csv_rotation(self):
         (self.tmp / "snapshots.csv").write_text("old,header\n1,2\n")
         eng, api = make_engine(self.tmp, variants=[{"name": "t60", "min_edge": 0.05, "rule": "t60"},

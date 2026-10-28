@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 pm2 jlist 2>/dev/null | python3 -c '
 import json,sys,time
 for p in json.load(sys.stdin):
-    if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard","polymm-fast","polymm-eth","polymm-alts","polymm-wide10","polymm-wide16","polymm-wide20","polymm-wide26","polymm-wide32","polymm-wide40","polymm-grid","polyarb","polyfv-tune"):
+    if p["name"] in ("polycopy-sim","polymm-sim","polyfv-sim","polymm-t60","polymm-guard","polymm-fast","polymm-eth","polymm-alts","polymm-wide10","polymm-wide16","polymm-wide20","polymm-wide26","polymm-wide32","polymm-wide40","polymm-grid","polyarb","polyfv-tune","polyfv-lag","polyfv-lag"):
         e=p["pm2_env"]; up=(time.time()*1000-e.get("pm_uptime",0))/60000
         print("== %s: %s, работает %.0f мин, перезапусков %s" % (p["name"], e["status"], up, e.get("restart_time",0)))'
 echo; echo "===== КОПИ-БОТ ====="

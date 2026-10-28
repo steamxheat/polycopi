@@ -1,0 +1,14 @@
+{
+  "loop_s": 0.1,
+  "variants": [
+    {"name": "lag3-1s", "min_edge": 0.02, "move_bps": 3, "move_s": 1, "ask_stale_s": 1},
+    {"name": "lag5-1s", "min_edge": 0.02, "move_bps": 5, "move_s": 1, "ask_stale_s": 1},
+    {"name": "lag3-2s", "min_edge": 0.02, "move_bps": 3, "move_s": 2, "ask_stale_s": 2},
+    {"name": "lag5-2s", "min_edge": 0.02, "move_bps": 5, "move_s": 2, "ask_stale_s": 2},
+    {"name": "lag8-3s", "min_edge": 0.02, "move_bps": 8, "move_s": 3, "ask_stale_s": 2},
+    {"name": "lag3-1s-any", "min_edge": 0.0, "move_bps": 3, "move_s": 1, "ask_stale_s": 1},
+    {"name": "lag5-1s-any", "min_edge": 0.0, "move_bps": 5, "move_s": 1, "ask_stale_s": 1},
+    {"name": "lag3-1s-t60", "min_edge": 0.02, "rule": "t60", "move_bps": 3, "move_s": 1, "ask_stale_s": 1},
+    {"name": "lag5-0.5s", "min_edge": 0.02, "move_bps": 5, "move_s": 0.5, "ask_stale_s": 0.5}
+  ]
+}
