@@ -53,10 +53,17 @@ class SensTests(unittest.TestCase):
         self.assertGreater(sens.z_threshold(16), sens.z_threshold(1))   # перебор -> строже
 
     def test_eff_k_counts_only_independent_variants(self):
-        one = [{"t": "1", "vwap": 0.5}]
-        self.assertEqual(sens.eff_k({"a": one, "b": list(one)}), 1.0)   # то же самое
-        self.assertEqual(sens.eff_k({"a": one, "b": [{"t": "2", "vwap": 0.6}]}), 2.0)
-        self.assertEqual(sens.eff_k({"a": one}), 1.0)
+        def v(*pairs):
+            return [{"t": "1", "vwap": 0.5, "what": pr} for pr in pairs]
+        same = v(("s1", "Up"), ("s2", "Up"))
+        self.assertEqual(sens.eff_k({"a": same, "b": v(("s1", "Up"), ("s2", "Up"))}), 1.0)
+        self.assertEqual(sens.eff_k({"a": same, "b": v(("s3", "Up"), ("s4", "Up"))}), 2.0)
+        part = sens.eff_k({"a": same, "b": v(("s1", "Up"), ("s9", "Up"))})
+        self.assertTrue(1.0 < part < 2.0, part)            # половина сделок общая
+        self.assertEqual(sens.eff_k({"a": same}), 1.0)
+        # метка времени у каждого варианта своя -> на неё опираться нельзя
+        self.assertEqual(sens.eff_k({"a": [{"t": "1.001", "vwap": 0.5, "what": ("s1", "Up")}],
+                                     "b": [{"t": "1.004", "vwap": 0.5, "what": ("s1", "Up")}]}), 1.0)
         self.assertEqual(sens.z_threshold(1), 2.0)
         self.assertGreater(sens.z_threshold(16), sens.z_threshold(2))
 

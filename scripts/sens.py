@@ -46,7 +46,7 @@ def load_state(d: Path):
                 out.setdefault(name, []).append(
                     {"v": name, "shares": float(t["shares"]), "vwap": float(t["vwap"]),
                      "win": bool(t.get("won")), "edge": float(t.get("edge_fill") or 0.0),
-                     "t": f"{float(t['t']):.3f}"})
+                     "t": f"{float(t['t']):.3f}", "what": (t.get("slug", ""), t.get("side", ""))})
             except (TypeError, ValueError, KeyError):
                 continue
     return out
@@ -69,7 +69,8 @@ def load(d: Path):
                 t = {"v": r["variant"], "shares": float(r["shares"]),
                      "vwap": float(r["fill_vwap"]), "win": r["side"] == w,
                      "edge": float(r.get("edge_fill") or 0.0),
-                     "t": r.get("time_utc") or ""}
+                     "t": r.get("time_utc") or "",
+                     "what": (r["slug"], r["side"])}
             except (TypeError, ValueError):
                 continue
             trades.setdefault(t["v"], []).append(t)
@@ -122,7 +123,9 @@ def eff_k(trades: dict[str, list[dict]]) -> float:
     vs = list(trades.values())
     if len(vs) < 2:
         return float(len(vs) or 1)
-    keys = [{(t["t"], round(t["vwap"], 4)) for t in ts} for ts in vs]
+    # одна и та же возможность = тот же рынок и та же сторона. Метка времени не
+    # годится: бот берёт её заново для каждого варианта, она отличается на микросекунды.
+    keys = [{t.get("what") or (t["t"],) for t in ts} for ts in vs]
     sims = []
     for i in range(len(keys)):
         for j in range(i + 1, len(keys)):
