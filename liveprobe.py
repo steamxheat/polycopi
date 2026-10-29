@@ -150,10 +150,40 @@ class LiveTrader:
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     env[k.strip()] = v.strip().strip('"').strip("'")
-        for k in ("POLYMARKET_PRIVATE_KEY", "POLYMARKET_WALLET_ADDRESS"):
+        for k in ("POLYMARKET_PRIVATE_KEY", "POLYMARKET_WALLET_ADDRESS",
+                  "POLYMARKET_RELAYER_API_KEY", "POLYMARKET_RELAYER_API_KEY_ADDRESS",
+                  "POLYMARKET_BUILDER_API_KEY", "POLYMARKET_BUILDER_SECRET",
+                  "POLYMARKET_BUILDER_PASSPHRASE"):
             if os.environ.get(k):
                 env[k] = os.environ[k]
         return env
+
+    @staticmethod
+    def client_kwargs(cr: dict):
+        """Собирает аргументы клиента из того, что есть.
+
+        Операции без газа требуют ключа Relayer (для существующего счёта) или
+        Builder (для создания нового). Одного приватного ключа хватает только
+        для EOA-торговли, а она доступна лишь разрешённым адресам.
+        """
+        from polymarket import AsyncSecureClient                 # noqa: PLC0415,F401
+
+        kw = {"private_key": cr["POLYMARKET_PRIVATE_KEY"]}
+        if cr.get("POLYMARKET_WALLET_ADDRESS"):
+            kw["wallet"] = cr["POLYMARKET_WALLET_ADDRESS"]
+        if cr.get("POLYMARKET_RELAYER_API_KEY"):
+            from polymarket import RelayerApiKey                 # noqa: PLC0415
+            kw["api_key"] = RelayerApiKey(
+                key=cr["POLYMARKET_RELAYER_API_KEY"],
+                address=cr.get("POLYMARKET_RELAYER_API_KEY_ADDRESS", ""))
+        elif cr.get("POLYMARKET_BUILDER_API_KEY"):
+            from polymarket import BuilderApiKey                 # noqa: PLC0415
+            kw["api_key"] = BuilderApiKey(
+                key=cr["POLYMARKET_BUILDER_API_KEY"],
+                secret=cr.get("POLYMARKET_BUILDER_SECRET", ""),
+                passphrase=cr.get("POLYMARKET_BUILDER_PASSPHRASE", ""))
+            kw.pop("wallet", None)          # Builder сам выводит и разворачивает кошелёк
+        return kw
 
     async def start(self):
         from polymarket import AsyncSecureClient                 # noqa: PLC0415
@@ -162,9 +192,10 @@ class LiveTrader:
         if not cr.get("POLYMARKET_PRIVATE_KEY"):
             raise SystemExit("Нет ключа. Положи POLYMARKET_PRIVATE_KEY в ~/.polymarket.env "
                              "(chmod 600). В чат ключ не присылать.")
-        kw = {"private_key": cr["POLYMARKET_PRIVATE_KEY"]}
-        if cr.get("POLYMARKET_WALLET_ADDRESS"):
-            kw["wallet"] = cr["POLYMARKET_WALLET_ADDRESS"]
+        kw = self.client_kwargs(cr)
+        kinds = [k for k in ("api_key", "wallet") if k in kw]
+        log.info("Подключаюсь: приватный ключ"
+                 + (f" + {', '.join(kinds)}" if kinds else " (без ключа API — только EOA)"))
         self.client = await AsyncSecureClient.create(**kw)
         log.info(f"Кошелёк подключён, тип {getattr(self.client, 'wallet_type', '?')}")
         await self.preflight()
@@ -428,10 +459,24 @@ def check() -> str:
     L.append(f"ЖИВОЙ РЕЖИМ НЕ ЗАПУСКАТЬ: отсутствуют {', '.join(missing)}" if missing else
              "Базовые методы на месте. Вызовы в коде надо сверить с подписями выше.")
     cr = LiveTrader.credentials()
-    L += ["", "ключ найден: " + ("да" if cr.get("POLYMARKET_PRIVATE_KEY") else
-                                 "НЕТ (~/.polymarket.env или переменная окружения)"),
-          "адрес кошелька: " + ("указан" if cr.get("POLYMARKET_WALLET_ADDRESS") else
-                                "не указан (нужен для обычного кошелька)")]
+    L += ["", "--- что есть в ~/.polymarket.env (значения не показываю) ---"]
+    have = {
+        "приватный ключ подписи": "POLYMARKET_PRIVATE_KEY",
+        "адрес кошелька": "POLYMARKET_WALLET_ADDRESS",
+        "ключ Relayer": "POLYMARKET_RELAYER_API_KEY",
+        "адрес ключа Relayer": "POLYMARKET_RELAYER_API_KEY_ADDRESS",
+        "ключ Builder": "POLYMARKET_BUILDER_API_KEY",
+    }
+    for label, key in have.items():
+        L.append(f"  {'✅' if cr.get(key) else '—'} {label}")
+    if not cr.get("POLYMARKET_PRIVATE_KEY"):
+        L += ["", "Без приватного ключа живой режим не запустится."]
+    elif cr.get("POLYMARKET_RELAYER_API_KEY") or cr.get("POLYMARKET_BUILDER_API_KEY"):
+        L += ["", "Набор полный: торговля без газа будет работать."]
+    else:
+        L += ["", "Есть только приватный ключ. Это путь EOA — он работает лишь для",
+              "разрешённых адресов и требует POL на газ. Для обычного счёта нужен",
+              "ключ Relayer с polymarket.com (профиль -> API/разработчику)."]
     return "\n".join(L)
 
 

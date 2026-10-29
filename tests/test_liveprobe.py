@@ -356,6 +356,75 @@ class CheckIntrospectionTests(unittest.TestCase):
                 sys.modules.pop(name, None)
 
 
+class CredentialsTests(unittest.TestCase):
+    """Набор ключей решает, какой способ подключения доступен."""
+
+    def setUp(self):
+        import types
+        self.mod = types.ModuleType("polymarket")
+        self.mod.AsyncSecureClient = object
+
+        class Relayer:
+            def __init__(self, key, address):
+                self.key, self.address = key, address
+
+        class Builder:
+            def __init__(self, key, secret, passphrase):
+                self.key = key
+        self.mod.RelayerApiKey, self.mod.BuilderApiKey = Relayer, Builder
+        self.saved = sys.modules.get("polymarket")
+        sys.modules["polymarket"] = self.mod
+
+    def tearDown(self):
+        if self.saved is None:
+            sys.modules.pop("polymarket", None)
+        else:
+            sys.modules["polymarket"] = self.saved
+
+    def test_private_key_only(self):
+        kw = liveprobe.LiveTrader.client_kwargs({"POLYMARKET_PRIVATE_KEY": "k"})
+        self.assertEqual(set(kw), {"private_key"})
+
+    def test_relayer_key_is_passed(self):
+        kw = liveprobe.LiveTrader.client_kwargs({
+            "POLYMARKET_PRIVATE_KEY": "k", "POLYMARKET_WALLET_ADDRESS": "0xабв",
+            "POLYMARKET_RELAYER_API_KEY": "r", "POLYMARKET_RELAYER_API_KEY_ADDRESS": "0xкл"})
+        self.assertEqual(kw["wallet"], "0xабв")
+        self.assertEqual(kw["api_key"].key, "r")
+        self.assertEqual(kw["api_key"].address, "0xкл")
+
+    def test_builder_key_drops_wallet(self):
+        """С ключом Builder кошелёк выводится сам — передавать его нельзя."""
+        kw = liveprobe.LiveTrader.client_kwargs({
+            "POLYMARKET_PRIVATE_KEY": "k", "POLYMARKET_WALLET_ADDRESS": "0xабв",
+            "POLYMARKET_BUILDER_API_KEY": "b", "POLYMARKET_BUILDER_SECRET": "s",
+            "POLYMARKET_BUILDER_PASSPHRASE": "p"})
+        self.assertNotIn("wallet", kw)
+        self.assertEqual(kw["api_key"].key, "b")
+
+    def test_check_lists_what_is_missing(self):
+        import os
+        os.environ["POLYMARKET_PRIVATE_KEY"] = "СЕКРЕТ"
+        try:
+            txt = liveprobe.check()
+            self.assertIn("✅ приватный ключ подписи", txt)
+            self.assertIn("— ключ Relayer", txt)
+            self.assertIn("путь EOA", txt)
+            self.assertNotIn("СЕКРЕТ", txt)          # значения не показываем
+        finally:
+            del os.environ["POLYMARKET_PRIVATE_KEY"]
+
+    def test_check_says_set_is_complete(self):
+        import os
+        os.environ["POLYMARKET_PRIVATE_KEY"] = "k"
+        os.environ["POLYMARKET_RELAYER_API_KEY"] = "r"
+        try:
+            self.assertIn("Набор полный", liveprobe.check())
+        finally:
+            del os.environ["POLYMARKET_PRIVATE_KEY"]
+            del os.environ["POLYMARKET_RELAYER_API_KEY"]
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
