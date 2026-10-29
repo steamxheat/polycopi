@@ -45,17 +45,25 @@ async def page_items(v):
     return [v] if v is not None else []
 
 
+keep_seen = ("side", "outcome", "price", "size", "quantity", "shares", "balance",
+             "redeemable", "payout", "realized_pnl", "unrealized_pnl", "asset_id",
+             "market", "slug", "status", "amount", "value", "timestamp",
+             "match_time", "type", "winning_outcome", "resolved")
+
+
 def brief(x) -> str:
     """Короткая строка о сделке/позиции: только то, что нужно для сверки."""
     d = x if isinstance(x, dict) else getattr(x, "__dict__", {}) or {}
-    keep = ("side", "outcome", "price", "size", "asset_id", "market", "slug",
-            "status", "amount", "value", "timestamp", "match_time", "type")
+    keep = ("side", "outcome", "price", "size", "quantity", "shares", "balance",
+            "redeemable", "payout", "realized_pnl", "unrealized_pnl", "asset_id",
+            "market", "slug", "status", "amount", "value", "timestamp",
+            "match_time", "type", "winning_outcome", "resolved")
     bits = []
     for k in keep:
         v = d.get(k)
         if v in (None, "", 0):
             continue
-        if k in ("amount", "value"):
+        if k in ("amount", "value", "payout", "realized_pnl", "unrealized_pnl"):
             v = usd(v)
         bits.append(f"{k}={str(v)[:44]}")
     return "  ".join(bits) or str(x)[:160]
@@ -97,6 +105,13 @@ async def main() -> None:
         total = 0.0
         for r in rows[:30]:
             print(" ", brief(r))
+            if label == "позиции":               # по позициям хотим ВСЕ поля:
+                d = r if isinstance(r, dict) else getattr(r, "__dict__", {}) or {}
+                extra = {k: v for k, v in d.items()
+                         if k not in keep_seen and v not in (None, "", 0)}
+                if extra:
+                    print("     ещё:", "  ".join(f"{k}={str(v)[:40]}"
+                                                 for k, v in list(extra.items())[:14]))
             d = r if isinstance(r, dict) else getattr(r, "__dict__", {}) or {}
             for k in ("value", "amount"):
                 v = to_units(_num(d.get(k)), 1e4)
