@@ -1,4 +1,6 @@
+import asyncio
 import csv
+import logging
 import shutil
 import sys
 import tempfile
@@ -113,6 +115,50 @@ class LifetimeTests(unittest.TestCase):
         w.book.on_event({"event_type": "book", "asset_id": "ZZZ",
                          "asks": [{"price": "0.60", "size": "10"}]}, api.t)
         self.assertNotIn("ZZZ", w.open_level)
+
+
+class MemoryTests(unittest.TestCase):
+    """За ночь уровней набирается сотни тысяч: в памяти их держать нельзя."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_lives_bounded_but_counted(self):
+        w, api, _ = mkw(self.tmp)
+        cap = w.lives.maxlen
+        for i in range(cap + 500):
+            api.t += 0.01
+            w.book.on_event({"event_type": "book", "asset_id": "U",
+                             "asks": [{"price": f"{0.10 + (i % 80) * 0.01:.2f}", "size": "10"}]},
+                            api.t)
+        self.assertLessEqual(len(w.lives), cap)          # память не растёт без предела
+        self.assertGreater(w.n_lives, cap)               # но счётчик точный
+        self.assertIn(str(w.n_lives), self._status(w))
+
+    def _status(self, w):
+        rec = []
+        h = logging.Handler()
+        h.emit = lambda r: rec.append(r.getMessage())
+        lvl = fillcheck.log.level
+        fillcheck.log.addHandler(h)
+        fillcheck.log.setLevel(logging.INFO)
+        try:
+            w.status()
+        finally:
+            fillcheck.log.removeHandler(h)
+            fillcheck.log.setLevel(lvl)
+        return " ".join(rec)
+
+    def test_dead_token_marks_are_dropped(self):
+        w, api, mk = mkw(self.tmp)
+        w.last_signal["U"] = api.t
+        api.t = mk.end + 300                             # окно давно закончилось
+        asyncio.run(w.discover())
+        self.assertNotIn("U", w.last_signal)
+        self.assertNotIn("U", w.tok_mkt)
 
 
 class SurvivalTests(unittest.TestCase):

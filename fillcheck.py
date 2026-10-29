@@ -120,12 +120,16 @@ class Watcher:
         self.counters: dict[str, int] = defaultdict(int)
         self.ws_last = 0.0
         self.open_level: dict[str, tuple] = {}        # tok -> (цена, когда появилась, рывок)
-        self.lives: list[tuple] = []                  # (life_ms, after_move)
+        # ВАЖНО: всё измеренное пишется в CSV, в памяти держим только последнее окно
+        # для строки статуса — иначе за ночь это сотни тысяч записей и утечка.
+        self.lives: deque = deque(maxlen=20000)       # (life_ms, after_move)
+        self.n_lives = 0                              # точный счётчик, без хранения
         self.pending: deque = deque()                 # проверки выживания цены
-        self.surv: list[tuple] = []                   # (ask0, [ok по горизонтам])
+        self.surv: deque = deque(maxlen=5000)         # (ask0, [ok по горизонтам])
+        self.n_surv = 0
         self.last_signal: dict[str, float] = {}
-        self.rtt: list[float] = []
-        self.rest_age: list[float] = []
+        self.rtt: deque = deque(maxlen=5000)
+        self.rest_age: deque = deque(maxlen=5000)
         self.ghost_n = self.rest_n = 0
         self._rr = 0
         self._csv_checked: set[str] = set()
@@ -165,11 +169,13 @@ class Watcher:
         rs = self.rets(asset)
         return max(rs, key=abs) if rs else 0.0
 
-    def moved(self, asset: str, side: str) -> bool:
-        """Сдвинулась ли цена В СТОРОНУ side настолько, что бот захотел бы купить."""
+    def moved(self, asset: str, side: str, rets=None) -> bool:
+        """Сдвинулась ли цена В СТОРОНУ side настолько, что бот захотел бы купить.
+        rets можно передать готовыми: считать их на каждую сторону — впустую жечь процессор."""
         sgn = 1 if side == "Up" else -1
         need = self.cfg.get("lead_agree", 1)
-        return sum(1 for x in self.rets(asset) if sgn * x >= self.cfg["move_bps"]) >= need
+        rs = self.rets(asset) if rets is None else rets
+        return sum(1 for x in rs if sgn * x >= self.cfg["move_bps"]) >= need
 
     def _on_price(self, symbol: str, ts: float) -> None:
         """Новая цена с быстрой биржи — сразу проверяем условие и горизонты."""
@@ -194,6 +200,7 @@ class Watcher:
             after = abs(mv) >= self.cfg["move_bps"]
             if life_ms >= 0:
                 self.lives.append((life_ms, after))
+                self.n_lives += 1
                 self.count("levels")
                 self._csv("levels.csv", LEVEL_COLS, {
                     "time_utc": utc(t0), "asset": mk.asset if mk else "", "tok": tok[:12],
@@ -206,14 +213,21 @@ class Watcher:
     def check_signals(self):
         now = self.api.now()
         cfg = self.cfg
+        rets_by_asset: dict[str, list] = {}
         for mk in self.markets.values():
             tau = mk.end - now
             if tau < cfg["min_tau"] or now < mk.start:
                 continue
+            if mk.asset not in rets_by_asset:
+                rets_by_asset[mk.asset] = self.rets(mk.asset)
+            rs = rets_by_asset[mk.asset]
+            if not rs:
+                continue
+            mv_all = max(rs, key=abs)
             for side, tok in (("Up", mk.up), ("Down", mk.down)):
-                if not self.moved(mk.asset, side):
+                if not self.moved(mk.asset, side, rs):
                     continue
-                mv = self.move_bps(mk.asset)
+                mv = mv_all
                 a = self.book.ask.get(tok)
                 if a is None or not (cfg["min_price"] <= a <= cfg["max_price"]):
                     continue
@@ -247,6 +261,7 @@ class Watcher:
             p["ok"][t] = int(a is not None and a <= p["ask0"] + 1e-9)
             p["okt"][t] = int(a is not None and a <= p["ask0"] + tol + 1e-9)
         self.surv.append((p["ask0"], [p["ok"][t] for t in HORIZONS_MS]))
+        self.n_surv += 1
         row = {"time_utc": utc(p["t0"]), "asset": p["mk"].asset, "window": p["mk"].window,
                "tok": p["tok"][:12], "side": p["side"], "ask0": round(p["ask0"], 4),
                "move_bps": round(p["mv"], 2), "ask_age_s": round(p["age"], 2)}
@@ -333,6 +348,7 @@ class Watcher:
             for t in (m.up, m.down):
                 self.tok_mkt.pop(t, None)
                 self.open_level.pop(t, None)
+                self.last_signal.pop(t, None)
             m.resolved = True
 
     def status(self):
@@ -343,8 +359,8 @@ class Watcher:
             i = HORIZONS_MS.index(200)
             ok = f" | цена жива через 200мс: {sum(s[1][i] for s in self.surv) / len(self.surv):.0%}"
         g = f" | призраков {self.ghost_n}/{self.rest_n}" if self.rest_n else ""
-        self.info(f"ЗАМЕР рынков {len(self.markets)} | цены: {srcs} | уровней {len(self.lives)} "
-                  f"(медиана жизни {med}) | сигналов {len(self.surv)}{ok}{g}")
+        self.info(f"ЗАМЕР рынков {len(self.markets)} | цены: {srcs} | уровней {self.n_lives} "
+                  f"(медиана жизни {med}) | сигналов {self.n_surv}{ok}{g}")
 
 
 # ======================================================================= циклы
