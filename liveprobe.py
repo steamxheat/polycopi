@@ -403,6 +403,11 @@ class Prober(fillcheck.Watcher):
 
     def status(self):
         super().status()
+        c = self.counters
+        s0 = sum(1 for m in self.markets.values() if m.s0)
+        self.info(f"ФИЛЬТР модель молчит {c.get('no_model', 0)}, перевес мал "
+                  f"{c.get('low_edge', 0)} | окон со стартовой ценой {s0}/{len(self.markets)} "
+                  f"| порог {self.cfg['min_edge'] * 100:.0f}¢")
         if self.sends:
             fil = sum(1 for r in self.results if r["filled"] > 0)
             self.info(f"ЗАЯВКИ {self.orders}, исполнено {fil}, потрачено ${self.spent:.2f}, "
