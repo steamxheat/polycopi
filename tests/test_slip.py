@@ -55,6 +55,29 @@ class ArithmeticTests(unittest.TestCase):
         self.assertLess(s["lo"], s["slack"])
 
 
+class MultipleLooksTests(unittest.TestCase):
+    """Смотреть шесть диапазонов и брать лучший — шесть попыток, не одна."""
+
+    def test_one_bucket_is_the_plain_bound(self):
+        self.assertAlmostEqual(slip.z_for(1), 1.96, places=2)
+
+    def test_six_buckets_demand_more(self):
+        self.assertGreater(slip.z_for(6), 2.6)
+        self.assertLess(slip.z_for(6), 2.8)
+
+    def test_more_buckets_demand_more_still(self):
+        self.assertLess(slip.z_for(2), slip.z_for(6))
+
+    def test_correction_can_flip_the_verdict(self):
+        """74% по 0.60 на 113 сделках проходит как один диапазон, но не как
+        лучший из шести — ровно эту ошибку мы и делали."""
+        tr = [mk(0.60, True)] * 84 + [mk(0.60, False)] * 29
+        alone = slip.stats(tr)
+        se = alone["se"]
+        self.assertGreater(alone["slack"] - 1.96 * se, 0.04)
+        self.assertLess(alone["slack"] - slip.z_for(6) * se, 0.04)
+
+
 class FillTests(unittest.TestCase):
     def test_reads_survival_by_bucket(self):
         with tempfile.TemporaryDirectory() as td:
@@ -91,15 +114,15 @@ class ReportTests(unittest.TestCase):
         self.assertIn("торговать нечем", txt)
 
     def test_core_bucket_good_when_there_are_enough_trades(self):
-        tr = ([mk(0.60, True)] * 74 + [mk(0.60, False)] * 26) * 4      # 400 сделок
+        tr = ([mk(0.60, True)] * 74 + [mk(0.60, False)] * 26) * 8      # 800 сделок
         txt = slip.report(self._dir(tr), "V", None)
         self.assertIn("ЕСТЬ", txt)
         self.assertIn("0.50-0.70", txt)
         self.assertIn("торговать 0.50-0.70", txt)
 
     def test_core_on_a_hundred_trades_is_only_thin(self):
-        """74% по 0.60 на 100 сделках: в среднем 12¢, но наверняка лишь ~4¢ —
-        ровно столько, сколько мы сами переплачиваем."""
+        """74% по 0.60 на 100 сделках: в среднем 12¢, но наверняка мало —
+        меньше, чем мы сами переплачиваем."""
         tr = [mk(0.60, True)] * 74 + [mk(0.60, False)] * 26
         txt = slip.report(self._dir(tr), "V", None)
         self.assertIn("ТОНКО", txt)

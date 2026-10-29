@@ -42,6 +42,23 @@ def per_share(t: dict) -> float:
     return (1.0 - p if t["win"] else -p) - fee(p)
 
 
+def z_for(k: int) -> float:
+    """Запас по нижней границе при выборе лучшего из k диапазонов.
+
+    Смотреть шесть диапазонов и брать лучший — это шесть попыток, а не одна.
+    Ровно так нас обманул дешёвый диапазон. Делим риск ошибки на k
+    (поправка Бонферрони): 1 диапазон -> 1.96 сигмы, 6 -> около 2.64.
+    """
+    k = max(int(k), 1)
+    if k == 1:
+        return 1.96
+    try:
+        from statistics import NormalDist             # noqa: PLC0415
+        return NormalDist().inv_cdf(1 - 0.05 / (2 * k))
+    except Exception:                                 # noqa: BLE001
+        return 1.96 + 0.52 * math.log(k)
+
+
 def stats(trades: list[dict]) -> dict:
     n = len(trades)
     if not n:
@@ -89,16 +106,23 @@ def report(d: Path, variant: str, fillpath: Path | None) -> str:
         have = ", ".join(sorted(hist)) or "ничего"
         return f"Нет сделок варианта {variant} в {d}. Есть: {have}"
     fl = fills(fillpath) if fillpath else {}
-    L = [f"Запас прочности по цене билета — {variant}, сделок {len(tr)}", ""]
+    nb = sum(1 for b in BUCKETS if any(b[0] <= t["vwap"] < b[1] for t in tr))
+    L = [f"Запас прочности по цене билета — {variant}, сделок {len(tr)}",
+         f"Диапазонов с данными {nb}, поэтому нижняя граница берётся с запасом "
+         f"{z_for(nb):.2f} сигмы (выбираем лучший из {nb}, а не один заранее названный).",
+         ""]
     L.append("  цена билета  сделок  попаданий   средняя   запас, ¢   наверняка   "
              "после переплаты   исполнение")
     L.append("  " + "-" * 100)
     rows = []
+    seen = [b for b in BUCKETS if any(b[0] <= t["vwap"] < b[1] for t in tr)]
+    z = z_for(len(seen))
     for b in BUCKETS:
         part = [t for t in tr if b[0] <= t["vwap"] < b[1]]
         s = stats(part)
         if not s["n"]:
             continue
+        s["lo"] = s["slack"] - z * s["se"]           # с поправкой на выбор лучшего
         f = fl.get(b)
         fs = f"{100 * f[1] / f[0]:.0f}% ({f[0]})" if f and f[0] else "нет данных"
         net = s["lo"] - OUR_SLIP_CAP
@@ -108,7 +132,8 @@ def report(d: Path, variant: str, fillpath: Path | None) -> str:
                  f"        {100 * net:+7.1f}       {fs}")
         rows.append((b, s))
     L += ["", "  запас — на сколько центов можем переплачивать за билет и остаться в нуле.",
-          "  наверняка — тот же запас по нижней границе (95%): меньше этого не будет.",
+          f"  наверняка — нижняя граница с поправкой на выбор лучшего из "
+          f"{nb}: меньше этого не будет.",
           f"  после переплаты — что останется, если платим наши "
           f"{100 * OUR_SLIP_CAP:.0f}¢ сверх аска.", ""]
 
