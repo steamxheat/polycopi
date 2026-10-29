@@ -157,3 +157,46 @@ class StrategyDocTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DependentOutcomesTests(unittest.TestCase):
+    """29.10: девять покупок пришлись на ТРИ исхода. Считать их девятью
+    независимыми ставками нельзя — на этом я уже ошибся дважды."""
+
+    def test_probability_counts_outcomes_not_purchases(self):
+        # цены исходов: ETH-15m Up ~0.10, BTC-15m Up ~0.07, ETH-5m Down 0.08
+        by_outcome = (1 - 0.90) * 0 + 1  # заглушка от опечаток ниже
+        p_all_lose = 0.90 * 0.93 * 0.92
+        self.assertAlmostEqual(p_all_lose, 0.77, delta=0.01)
+        wrong = 0.9 ** 9                  # прежний расчёт по девяти покупкам
+        self.assertAlmostEqual(wrong, 0.39, delta=0.01)
+        self.assertGreater(p_all_lose, wrong)   # зависимость делает исход ОБЫЧНЕЕ
+        self.assertTrue(by_outcome)
+
+    def test_handoff_quotes_the_corrected_figure(self):
+        self.assertIn("77%", DOC)
+        self.assertIn("три исхода", DOC)
+
+    def test_handoff_no_longer_claims_independence(self):
+        self.assertNotIn("вероятность 39%", DOC)
+
+
+class PowerCalcTests(unittest.TestCase):
+    """Срок проверки Г-2 обязан считаться тем коэффициентом, который записан
+    в самой гипотезе (2.64), а не удобным (1.96)."""
+
+    @staticmethod
+    def n_needed(slack: float, z: float, thr: float = 0.04, sd: float = 0.45) -> float:
+        return (z * sd / (slack - thr)) ** 2
+
+    def test_recorded_correction_demands_far_more_trades(self):
+        self.assertAlmostEqual(self.n_needed(0.12, 2.64), 221, delta=3)
+        self.assertAlmostEqual(self.n_needed(0.12, 1.96), 122, delta=3)
+
+    def test_small_edge_is_undetectable_by_this_test(self):
+        self.assertGreater(self.n_needed(0.06, 2.64), 3000)
+
+    def test_answers_doc_states_both_coefficients(self):
+        ans = (ROOT / "docs" / "ANSWERS_2026-10-29.md").read_text()
+        for s in ("2.64", "1.96", "221", "3528"):
+            self.assertIn(s, ans)
