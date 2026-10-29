@@ -494,3 +494,17 @@ class PctTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiscoverIntegrityTests(unittest.TestCase):
+    """Правка дважды разрезала discover пополам: очистка старых окон уезжала
+    в соседний метод, и мёртвые рынки оставались в памяти навсегда."""
+
+    def test_cleanup_lives_inside_discover(self):
+        import inspect
+        src = inspect.getsource(fillcheck.Watcher.discover)
+        self.assertIn("resolved = True", src)
+        self.assertIn("last_signal.pop", src)
+
+    def test_hook_is_its_own_method(self):
+        self.assertTrue(callable(getattr(fillcheck.Watcher, "on_new_market", None)))

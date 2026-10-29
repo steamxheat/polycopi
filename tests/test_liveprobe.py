@@ -608,7 +608,8 @@ class BuyArgsTests(unittest.IsolatedAsyncioTestCase):
         t = liveprobe.LiveTrader(cfg)
         t.client = Client()
         r = await t.buy("TOK", 0.10, 5.0)                 # 5 * 0.10 = $0.50 — мало
-        self.assertEqual(sent["amount"], "1.00")
+        # Минимум биржи — 5 билетов, значит $0.50, а не выдуманный $1.
+        self.assertEqual(sent["amount"], "0.50")
         self.assertIn("подпись", r["error"])               # упало на подписи, не на отправке
 
 
@@ -768,9 +769,16 @@ class BalanceCapTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_trimmed_to_balance(self):
         t, got = self._trader(1.93)                  # на счёте $1.93
-        r = await t.buy("TOK", 0.93, 5.0)            # хотели $4.65
-        self.assertEqual(got["amount"], "1.83")      # 1.93 * 0.95
-        self.assertAlmostEqual(r["shares_sent"], 1.9677, places=3)
+        r = await t.buy("TOK", 0.93, 5.0)            # 5 билетов = $4.65
+        # Урезать нельзя: минимум биржи — 5 билетов, а денег на них нет.
+        self.assertEqual(r["status"], "no_funds")
+        self.assertEqual(got, {})
+
+    async def test_order_trimmed_when_above_the_share_minimum(self):
+        t, got = self._trader(10.0)                  # хватает на 10 билетов по 0.95
+        r = await t.buy("TOK", 0.95, 50.0)           # хотели 50
+        self.assertEqual(got["amount"], "9.50")      # 10.0 * 0.95 = $9.50
+        self.assertAlmostEqual(r["shares_sent"], 10.0, places=2)
 
     async def test_full_size_when_money_is_there(self):
         t, got = self._trader(50.0)
@@ -942,7 +950,8 @@ class RiskLimitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r["status"], "too_big")
         self.assertEqual(got, {})                    # бирже ничего не послали
         self.assertIn("не влезает в риск", r["error"])
-        self.assertIn("$50", r["error"])             # подсказка, сколько нужно
+        self.assertIn("5 билетов", r["error"])
+        self.assertIn("$12", r["error"])             # по цене 0.05 хватило бы $12
 
     async def test_the_old_behaviour_is_gone(self):
         """Раньше $0.25 раздувалось до $1 — 10% счёта. Больше нет."""
@@ -950,10 +959,19 @@ class RiskLimitTests(unittest.IsolatedAsyncioTestCase):
         await t.buy("TOK", 0.05, 5.0)
         self.assertNotIn("amount", got)
 
-    async def test_small_account_still_trades_within_its_share(self):
-        t, got = self._trader(80.0, risk_frac=0.02)  # 2% = $1.60
-        await t.buy("TOK", 0.60, 5.0)                # хотели $3.00
-        self.assertEqual(got["amount"], "1.60")
+    async def test_minimum_lot_in_the_working_range_needs_a_real_account(self):
+        """5 билетов по 0.60 = $3.00. При риске 2% это требует счёта $150 —
+        ровно весь бюджет. С $80 торговать в рабочем диапазоне нельзя."""
+        t, got = self._trader(80.0)                  # 2% = $1.60, а лот $3.00
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertEqual(r["status"], "too_big")
+        self.assertIn("$150", r["error"])
+        self.assertEqual(got, {})
+
+    async def test_full_account_can_trade_the_working_range(self):
+        t, got = self._trader(150.0)                 # 2% = $3.00 = ровно лот
+        await t.buy("TOK", 0.60, 5.0)
+        self.assertEqual(got["amount"], "3.00")
 
 
 class LossCapTests(unittest.TestCase):
@@ -989,3 +1007,61 @@ class LossCapTests(unittest.TestCase):
         pr = self._probe(10.48, 8.98)
         self.assertLess(pr.spent, pr.cfg["max_spend_usd"])
         self.assertIn("% счёта", pr.budget_left())
+
+
+class ExchangeMinimumTests(unittest.IsolatedAsyncioTestCase):
+    """Минимум заявки у Polymarket задан в БИЛЕТАХ (minOrderSize в стакане),
+    а не в долларах. Выдуманный минимум $1 по цене 0.05 превращал 5 билетов
+    в 20 и умножил потерю втрое."""
+
+    def test_fallback_is_five_shares(self):
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        self.assertAlmostEqual(t.min_shares("нет-такого"), 5.0)
+
+    def test_exchange_value_wins_over_ours(self):
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.min_size["TOK"] = 20.0
+        self.assertAlmostEqual(t.min_shares("TOK"), 20.0)
+
+    def test_zero_from_the_exchange_is_ignored(self):
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.min_size["TOK"] = 0.0
+        self.assertAlmostEqual(t.min_shares("TOK"), 5.0)
+
+    async def test_minimum_read_when_a_market_appears(self):
+        """Читаем при появлении рынка, а не перед заявкой: перед заявкой
+        дорога каждая миллисекунда."""
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = dict(liveprobe.DEFAULTS)
+        pr.trader = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        asked = []
+
+        class Api:
+            async def get_book(self, tok):
+                asked.append(tok)
+                return {"min_order_size": "15"}
+
+        pr.api = Api()
+        mk = type("M", (), {"up": "U", "down": "D"})()
+        await pr.on_new_market(mk)
+        self.assertEqual(asked, ["U", "D"])
+        self.assertAlmostEqual(pr.trader.min_shares("U"), 15.0)
+
+    async def test_unreadable_book_leaves_our_fallback(self):
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = dict(liveprobe.DEFAULTS)
+        pr.trader = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+
+        class Api:
+            async def get_book(self, tok):
+                raise RuntimeError("нет связи")
+
+        pr.api = Api()
+        await pr.on_new_market(type("M", (), {"up": "U", "down": "D"})())
+        self.assertAlmostEqual(pr.trader.min_shares("U"), 5.0)
+
+    async def test_dry_mode_does_not_crash_on_new_market(self):
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = dict(liveprobe.DEFAULTS)
+        pr.trader = liveprobe.DryTrader()
+        await pr.on_new_market(type("M", (), {"up": "U", "down": "D"})())

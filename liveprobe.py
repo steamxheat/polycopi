@@ -67,7 +67,11 @@ ORDER_COLS = ["time_utc", "mode", "asset", "window", "side", "tok", "ask_seen", 
 DEFAULTS = dict(fillcheck.DEFAULTS)
 DEFAULTS.update({
     "shares": 5.0,              # минимум рынка; меньше нельзя
-    "min_order_usd": 1.0,       # не меньше доллара, иначе биржа отвергнет мелочь
+    # Минимума в ДОЛЛАРАХ у Polymarket нет — минимум в БИЛЕТАХ, и он лежит
+    # в самом стакане (minOrderSize, обычно 5). Прежняя выдумка min_order_usd=$1
+    # без нужды множила каждую ставку: по цене 0.05 вместо 5 билетов за $0.25
+    # уходило 20 билетов за $1. Девять сделок стоили $8.98 вместо $2.25.
+    "min_order_shares": 5.0,    # запасное значение, если стакан своего не дал
     "max_orders": 40,           # сколько всего заявок разрешено за запуск
     "max_spend_usd": 20.0,      # сколько всего денег разрешено потратить
     # Урок $8.98: минимум заявки $1 при счёте $10.48 — это 10% счёта на сделку.
@@ -220,6 +224,7 @@ class LiveTrader:
         # отправку (подпись прыгала с 8 до 151 мс — задача просто ждала очереди).
         self.balance: float | None = None     # долларов на счёте, None = не прочитан
         self.start_balance: float | None = None   # с чего начали — от него считаем предел потерь
+        self.min_size: dict[str, float] = {}      # минимум билетов по рынкам, из стакана
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
 
@@ -323,12 +328,15 @@ class LiveTrader:
             self.start_balance = self.balance
             log.info(f"Баланс: {usd(self.balance)}")
             cap = self.cfg["risk_frac"] * (self.balance or 0)
-            if self.balance and cap < self.cfg["min_order_usd"]:
+            # Минимальная заявка в рабочем диапазоне: min_order_shares по max_price.
+            floor = self.cfg["min_order_shares"] * self.cfg["max_price"]
+            if self.balance and cap < floor:
                 log.info(f"ВНИМАНИЕ: {self.cfg['risk_frac'] * 100:.0f}% от "
-                         f"{usd(self.balance)} = ${cap:.2f}, а минимум заявки "
-                         f"${self.cfg['min_order_usd']:.2f}. Заявки отправляться НЕ будут: "
-                         f"нужен счёт хотя бы "
-                         f"${self.cfg['min_order_usd'] / self.cfg['risk_frac']:.0f}.")
+                         f"{usd(self.balance)} = ${cap:.2f}, а минимальная заявка в нашем "
+                         f"диапазоне — {self.cfg['min_order_shares']:g} билетов по "
+                         f"{self.cfg['max_price']:.2f} = ${floor:.2f}. Заявки отправляться "
+                         f"НЕ будут: нужен счёт от "
+                         f"${floor / self.cfg['risk_frac']:.0f}.")
             need = self.cfg["shares"] * self.cfg["max_price"]
             if self.balance is not None and self.balance < need:
                 log.info(f"ВНИМАНИЕ: на {self.cfg['shares']:g} билетов по верхней цене нужно "
@@ -392,6 +400,12 @@ class LiveTrader:
             break                                 # самая свежая сделка идёт первой
         return (sz, round(pr / sz, 4)) if sz > 0 else None
 
+    def min_shares(self, tok: str) -> float:
+        """Минимум билетов для этого рынка. Биржа отдаёт его в стакане
+        (minOrderSize); своё значение — только если стакан молчит."""
+        v = _num(self.min_size.get(tok))
+        return v if v and v > 0 else self.cfg["min_order_shares"]
+
     async def read_balance(self) -> float | None:
         b = await self._in_thread(
             self.client.get_balance_allowance(asset_type="COLLATERAL"))
@@ -437,37 +451,40 @@ class LiveTrader:
         return out
 
     async def buy(self, tok: str, limit: float, shares: float) -> dict:
-        # Для покупки биржа требует СУММУ в долларах, а не количество билетов
-        # ("amount is required for BUY market orders"). Потолок цены задаём отдельно.
-        amount = max(round(shares * limit, 2), self.cfg["min_order_usd"])
-        # Больше, чем есть на счёте, бирже посылать незачем: заявку отвергнут,
-        # а мы решим, что не успели по скорости. Оставляем 5% на сборы.
-        if self.balance is not None:
-            room = round(self.balance * 0.95, 2)
-            if room < self.cfg["min_order_usd"]:
-                return {"ok": False, "status": "no_funds", "filled": 0.0, "avg_price": None,
-                        "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "note": "",
-                        "error": f"не хватает денег: на счёте {usd(self.balance)}, "
-                                 f"минимум заявки ${self.cfg['min_order_usd']:.2f}"}
-            # Доля счёта. Если задуманная ставка не влезает в неё из-за минимума
-            # заявки — НЕ торгуем. Раздувать ставку до минимума нельзя: именно так
-            # $0.25 превратились в $1, то есть 2% счёта в 10%.
-            cap = round(self.balance * self.cfg["risk_frac"], 2)
-            if amount > cap:
-                if cap < self.cfg["min_order_usd"]:
-                    return {"ok": False, "status": "too_big", "filled": 0.0,
-                            "avg_price": None, "spent": 0.0, "sign_ms": 0.0,
-                            "post_ms": 0.0, "note": "",
-                            "error": f"ставка не влезает в риск: {self.cfg['risk_frac'] * 100:.0f}% "
-                                     f"от {usd(self.balance)} = ${cap:.2f}, а минимум заявки "
-                                     f"${self.cfg['min_order_usd']:.2f}. Нужен счёт хотя бы "
-                                     f"${self.cfg['min_order_usd'] / self.cfg['risk_frac']:.0f}."}
-                amount = cap
-                shares = round(amount / limit, 4)
-            if amount > room:
-                amount = room
-                shares = round(amount / limit, 4)
-        before = self.balance
+        """Считаем В БИЛЕТАХ: минимум биржи задан в билетах, а не в деньгах.
+
+        Прежний код смешивал билеты и доллары и держал выдуманный минимум
+        в $1 — по цене 0.05 это превращало 5 билетов за $0.25 в 20 за $1.
+        """
+        floor = self.min_shares(tok)              # минимум биржи, из стакана
+        shares = max(shares, floor)
+        bal = self.balance
+
+        if bal is not None:
+            # 1) сколько денег вообще есть (5% оставляем на сборы). Это жёсткое
+            # ограничение биржи, поэтому проверяем его первым — иначе отказ
+            # по нашему риску скрывал бы простую нехватку денег.
+            room = bal * 0.95
+            if floor * limit > room:
+                return self._refuse(
+                    "no_funds",
+                    f"не хватает денег: на счёте {usd(bal)}, а минимальная заявка "
+                    f"{floor:g} билетов по {limit:.2f} = ${floor * limit:.2f}")
+            shares = min(shares, room / limit)
+            # 2) своя доля риска: больше risk_frac счёта на сделку не ставим
+            cap = bal * self.cfg["risk_frac"]
+            if floor * limit > cap:
+                return self._refuse(
+                    "too_big",
+                    f"ставка не влезает в риск: {self.cfg['risk_frac'] * 100:.0f}% от "
+                    f"{usd(bal)} = ${cap:.2f}, а минимум биржи {floor:g} билетов по "
+                    f"{limit:.2f} = ${floor * limit:.2f}. "
+                    f"Нужен счёт от ${floor * limit / self.cfg['risk_frac']:.0f}.")
+            shares = min(shares, cap / limit)
+
+        shares = round(max(shares, floor), 4)
+        amount = round(shares * limit, 2)
+        before = bal
         r = await self._in_thread(self._buy_here(tok, limit, shares, amount))
         r["shares_sent"] = shares
         r["limit_used"] = limit
@@ -476,6 +493,11 @@ class LiveTrader:
         if self.balance is None and r.get("spent"):
             self.balance = max((before or 0.0) - r["spent"], 0.0)
         return r
+
+    @staticmethod
+    def _refuse(status: str, why: str) -> dict:
+        return {"ok": False, "status": status, "filled": 0.0, "avg_price": None,
+                "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "note": "", "error": why}
 
     async def close(self):
         if self.client is None:
@@ -541,6 +563,25 @@ class Prober(fillcheck.Watcher):
             return None
         p = pr[rule] if side == "Up" else 1 - pr[rule]
         return p - ask - fvsim.fee(ask, self.cfg["taker_fee_coef"])
+
+    async def on_new_market(self, mk) -> None:
+        """Минимум заявки у Polymarket задан в БИЛЕТАХ и лежит в стакане
+        (minOrderSize, обычно 5). Читаем его у биржи вместо своей догадки:
+        выдуманный минимум в $1 по цене 0.05 превращал 5 билетов в 20.
+        """
+        tr = getattr(self.trader, "min_size", None)
+        if tr is None:
+            return
+        for tok in (mk.up, mk.down):
+            if tok in tr:
+                continue
+            try:
+                bk = await self.api.get_book(tok)
+            except Exception:  # noqa: BLE001
+                continue
+            v = _num((bk or {}).get("min_order_size") or (bk or {}).get("minOrderSize"))
+            if v and v > 0:
+                tr[tok] = v
 
     def budget_left(self) -> str:
         cfg = self.cfg

@@ -280,6 +280,11 @@ class Watcher:
         row.update({f"okt_{t}": p["okt"][t] for t in HORIZONS_MS})
         self._csv("survive.csv", SURV_COLS, row)
 
+    async def on_new_market(self, mk) -> None:
+        """Точка подключения: liveprobe читает здесь минимум заявки рынка.
+        Делаем это при появлении рынка, а не перед заявкой — перед заявкой
+        дорога каждая миллисекунда."""
+
     # ------------------------------------------------------ 3) призраки в REST
     async def check_rest(self):
         if not self.cfg.get("measure", True):
@@ -356,6 +361,7 @@ class Watcher:
                                    str(m.get("conditionId", "")))
                     self.markets[slug] = mk
                     self.tok_mkt[toks[0]] = self.tok_mkt[toks[1]] = mk
+                    await self.on_new_market(mk)
         # 15 минут, а не 2: итоги у Polymarket появляются не сразу, а по ним
         # считается прибыль купленных билетов — потеряем окно, потеряем позицию
         for slug in [s for s, m in self.markets.items() if m.end < now - 900]:
