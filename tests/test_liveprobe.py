@@ -24,7 +24,7 @@ class RecordTrader:
         self.sent = []
         self.reply = reply or {"ok": True, "status": "matched", "filled": 5.0,
                                "avg_price": 0.61, "spent": 5.0 * 0.61, "error": "",
-                               "note": ""}
+                               "note": "", "sign_ms": 5.0, "post_ms": 40.0}
         self.fail = fail
 
     async def start(self):
@@ -564,8 +564,12 @@ class BuyArgsTests(unittest.IsolatedAsyncioTestCase):
         sent = {}
 
         class Client:
-            async def place_market_order(self, **kw):
+            async def create_market_order(self, **kw):
                 sent.update(kw)
+                return "подписанная-заявка"
+
+            async def post_order(self, signed):
+                sent["posted"] = signed
                 class R:
                     ok = True
                     order_id = "x"
@@ -576,6 +580,9 @@ class BuyArgsTests(unittest.IsolatedAsyncioTestCase):
         t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
         t.client = Client()
         r = await t.buy("TOK", 0.61, 5.0)
+        self.assertEqual(sent["posted"], "подписанная-заявка")
+        self.assertIn("sign_ms", r)
+        self.assertIn("post_ms", r)
         self.assertEqual(sent["side"], "BUY")
         self.assertEqual(sent["asset_id"], "TOK")
         self.assertEqual(sent["amount"], "3.05")          # 5 * 0.61
@@ -588,15 +595,16 @@ class BuyArgsTests(unittest.IsolatedAsyncioTestCase):
         sent = {}
 
         class Client:
-            async def place_market_order(self, **kw):
+            async def create_market_order(self, **kw):
                 sent.update(kw)
                 raise RuntimeError("не важно")
         cfg = dict(liveprobe.DEFAULTS)
         cfg["min_order_usd"] = 1.0
         t = liveprobe.LiveTrader(cfg)
         t.client = Client()
-        await t.buy("TOK", 0.10, 5.0)                     # 5 * 0.10 = $0.50 — мало
+        r = await t.buy("TOK", 0.10, 5.0)                 # 5 * 0.10 = $0.50 — мало
         self.assertEqual(sent["amount"], "1.00")
+        self.assertIn("подпись", r["error"])               # упало на подписи, не на отправке
 
 
 class StatusTests(unittest.TestCase):
