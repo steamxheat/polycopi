@@ -148,3 +148,35 @@ class ReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MoneyColumnTests(unittest.TestCase):
+    """Откуда на самом деле взялись деньги: прибыль по диапазонам отдельно
+    от общей суммы, иначе один рабочий диапазон маскирует пять пустых."""
+
+    def _dir(self, trades):
+        import tempfile as tf
+        d = Path(tf.mkdtemp())
+        (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
+            {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
+             "t": t["ts"], "slug": t["what"][0], "side": "Up", "edge_fill": 0.0}
+            for t in trades]}}}))
+        return d
+
+    def test_money_is_shown_per_bucket(self):
+        tr = ([mk(0.60, True)] * 74 + [mk(0.60, False)] * 26) * 8
+        txt = slip.report(self._dir(tr), "V", None)
+        self.assertIn("деньги", txt)
+        self.assertIn("Всего", txt)
+
+    def test_share_from_proven_ranges_is_stated(self):
+        """Один хороший диапазон и один пустой: видно, сколько дал каждый."""
+        tr = ([mk(0.60, True)] * 74 + [mk(0.60, False)] * 26) * 8 \
+             + [mk(0.10, True)] * 4 + [mk(0.10, False)] * 28
+        txt = slip.report(self._dir(tr), "V", None)
+        self.assertIn("доказанным перевесом приходится", txt)
+
+    def test_money_follows_the_stake_size(self):
+        a = slip.stats([mk(0.60, True, shares=5.0)])
+        b = slip.stats([mk(0.60, True, shares=10.0)])
+        self.assertAlmostEqual(b["money"], 2 * a["money"], places=6)
