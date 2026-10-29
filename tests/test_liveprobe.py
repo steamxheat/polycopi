@@ -557,6 +557,48 @@ class CredentialsTests(unittest.TestCase):
             del os.environ["POLYMARKET_RELAYER_API_KEY"]
 
 
+class BuyArgsTests(unittest.IsolatedAsyncioTestCase):
+    """Биржа требует для покупки сумму в долларах, а не количество билетов."""
+
+    async def test_buy_sends_amount_and_price_cap(self):
+        sent = {}
+
+        class Client:
+            async def place_market_order(self, **kw):
+                sent.update(kw)
+                class R:
+                    ok = True
+                    order_id = "x"
+                    status = "matched"
+                    taking_amount = "5000000"
+                    making_amount = "3050000"
+                return R()
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.client = Client()
+        r = await t.buy("TOK", 0.61, 5.0)
+        self.assertEqual(sent["side"], "BUY")
+        self.assertEqual(sent["asset_id"], "TOK")
+        self.assertEqual(sent["amount"], "3.05")          # 5 * 0.61
+        self.assertEqual(sent["max_price"], "0.61")
+        self.assertEqual(sent["order_type"], "FAK")
+        self.assertNotIn("shares", sent)
+        self.assertAlmostEqual(r["filled"], 5.0)
+
+    async def test_small_order_raised_to_minimum(self):
+        sent = {}
+
+        class Client:
+            async def place_market_order(self, **kw):
+                sent.update(kw)
+                raise RuntimeError("не важно")
+        cfg = dict(liveprobe.DEFAULTS)
+        cfg["min_order_usd"] = 1.0
+        t = liveprobe.LiveTrader(cfg)
+        t.client = Client()
+        await t.buy("TOK", 0.10, 5.0)                     # 5 * 0.10 = $0.50 — мало
+        self.assertEqual(sent["amount"], "1.00")
+
+
 class StatusTests(unittest.TestCase):
     def test_status_is_in_commands_and_sends_no_orders(self):
         """status обязан быть только для чтения: ни одного вызова заявок."""

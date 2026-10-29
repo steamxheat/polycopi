@@ -64,6 +64,7 @@ ORDER_COLS = ["time_utc", "mode", "asset", "window", "side", "tok", "ask_seen", 
 DEFAULTS = dict(fillcheck.DEFAULTS)
 DEFAULTS.update({
     "shares": 5.0,              # минимум рынка; меньше нельзя
+    "min_order_usd": 1.0,       # не меньше доллара, иначе биржа отвергнет мелочь
     "max_orders": 40,           # сколько всего заявок разрешено за запуск
     "max_spend_usd": 20.0,      # сколько всего денег разрешено потратить
     "max_price": 0.95,          # дороже не покупаем никогда
@@ -263,9 +264,13 @@ class LiveTrader:
         log.info("Разрешения на торговлю выставлены")
 
     async def buy(self, tok: str, limit: float, shares: float) -> dict:
+        # Для покупки биржа требует СУММУ в долларах, а не количество билетов
+        # ("amount is required for BUY market orders"). Потолок цены задаём отдельно,
+        # поэтому дороже limit не возьмём, а билетов выйдет примерно shares.
+        amount = max(round(shares * limit, 2), self.cfg["min_order_usd"])
         try:
             r = await self.client.place_market_order(
-                asset_id=tok, side="BUY", shares=f"{shares:g}", max_price=f"{limit:.2f}",
+                asset_id=tok, side="BUY", amount=f"{amount:.2f}", max_price=f"{limit:.2f}",
                 order_type=self.cfg["order_type"])
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "status": "error", "filled": 0.0, "avg_price": None,
