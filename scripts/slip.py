@@ -99,6 +99,26 @@ def fills(path: Path) -> dict:
     return out
 
 
+def forecast(s: dict, z: float, target: int) -> float:
+    """Какой станет нижняя граница при target сделках, если попадание
+    удержится. Неопределённость падает как корень из числа сделок —
+    значит граница растёт сама, без улучшения стратегии.
+    """
+    if s["n"] < 2 or target <= s["n"]:
+        return s["lo"]
+    return s["slack"] - z * s["se"] * math.sqrt(s["n"] / target)
+
+
+def pace(trades: list[dict]) -> float:
+    """Сделок в час: считаем по рабочему диапазону, а не по всем сделкам.
+    Ошибка на этом месте дала оценку «к утру» вместо «через сутки»."""
+    ts = sorted(t["ts"] for t in trades if t.get("ts") is not None)
+    if len(ts) < 2:
+        return 0.0
+    hours = (ts[-1] - ts[0]) / 3600
+    return len(ts) / hours if hours > 0.5 else 0.0
+
+
 def report(d: Path, variant: str, fillpath: Path | None) -> str:
     hist = load_state(d)
     tr = hist.get(variant)
@@ -169,6 +189,23 @@ def report(d: Path, variant: str, fillpath: Path | None) -> str:
         lo, hi = good[0][0][0], good[-1][0][1]
         L += ["", f"  ИТОГ: торговать {lo:.2f}-{hi:.2f}, остальное закрыть "
                   f"порогами min_price/max_price."]
+    # Прогноз по лучшему диапазону: когда ждать ответа и каким он будет
+    if rows:
+        b, best = max(rows, key=lambda x: x[1]["lo"])
+        part = [t for t in tr if b[0] <= t["vwap"] < b[1]]
+        ph = pace(part)
+        L += ["", f"  Прогноз по {b[0]:.2f}-{b[1]:.2f}, если попадание удержится "
+                  f"на {100 * best['wins'] / best['n']:.1f}%:"]
+        for tgt in (180, 250, 400):
+            if tgt <= best["n"]:
+                continue
+            f = forecast(best, z, tgt)
+            when = f"{(tgt - best['n']) / ph:.0f} ч" if ph else "?"
+            mark = "хватит" if f - OUR_SLIP_CAP > 0 else "мало"
+            L.append(f"    при {tgt:4d} сделках -> наверняка {100 * f:+.1f}¢ "
+                     f"({mark}), ждать ~{when}")
+        if ph:
+            L.append(f"    темп {ph:.1f} сделок в час в этом диапазоне")
     if tot:
         pr = sum(s["money"] for b, s in rows if s["lo"] > 0)
         L.append(f"  Из {tot:+.2f}$ на диапазоны с доказанным перевесом приходится "

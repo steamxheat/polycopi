@@ -180,3 +180,66 @@ class MoneyColumnTests(unittest.TestCase):
         a = slip.stats([mk(0.60, True, shares=5.0)])
         b = slip.stats([mk(0.60, True, shares=10.0)])
         self.assertAlmostEqual(b["money"], 2 * a["money"], places=6)
+
+
+class ForecastTests(unittest.TestCase):
+    """Когда ждать ответа и каким он будет, если попадание удержится."""
+
+    def _s(self, wins, n, price=0.60):
+        tr = [mk(price, True)] * wins + [mk(price, False)] * (n - wins)
+        st = slip.stats(tr)
+        st["lo"] = st["slack"] - slip.z_for(6) * st["se"]
+        return st
+
+    def test_bound_grows_with_more_trades(self):
+        s = self._s(89, 123)
+        z = slip.z_for(6)
+        self.assertGreater(slip.forecast(s, z, 250), s["lo"])
+        self.assertGreater(slip.forecast(s, z, 400), slip.forecast(s, z, 250))
+
+    def test_our_case_passes_the_threshold_barely(self):
+        """Наши настоящие числа: 123 сделки, 89 побед, средняя цена 0.587.
+        При 250 сделках нижняя граница выходит около 4.5¢ — порог берётся,
+        но впритык."""
+        s = self._s(89, 123, price=0.587)
+        self.assertAlmostEqual(100 * s["slack"], 12.0, delta=0.3)   # сходится с сервером
+        f = slip.forecast(s, slip.z_for(6), 250)
+        self.assertAlmostEqual(100 * f, 4.5, delta=0.5)
+        self.assertGreater(f, slip.OUR_SLIP_CAP)
+
+    def test_at_the_round_price_it_would_not_pass(self):
+        """По цене ровно 0.60 того же попадания не хватило бы: 13 центов
+        средней цены решают, проходим мы порог или нет."""
+        s = self._s(89, 123, price=0.60)
+        self.assertLess(slip.forecast(s, slip.z_for(6), 250), slip.OUR_SLIP_CAP)
+
+    def test_weaker_hit_rate_never_passes(self):
+        """При 68% попаданий порог не берётся и на 400 сделках."""
+        s = self._s(68, 100)
+        self.assertLess(slip.forecast(s, slip.z_for(6), 400), slip.OUR_SLIP_CAP)
+
+    def test_forecast_does_not_look_backwards(self):
+        s = self._s(89, 123)
+        self.assertAlmostEqual(slip.forecast(s, slip.z_for(6), 50), s["lo"])
+
+    def test_pace_counts_only_this_range(self):
+        # 10 сделок за 2 часа -> 5 в час
+        tr = [mk(0.60, True, t=i * 720.0) for i in range(11)]
+        self.assertAlmostEqual(slip.pace(tr), 5.5, delta=0.01)
+
+    def test_pace_needs_enough_time_to_be_honest(self):
+        tr = [mk(0.60, True, t=float(i)) for i in range(5)]   # 5 сделок за 4 с
+        self.assertEqual(slip.pace(tr), 0.0)
+
+    def test_report_states_when_to_expect_the_answer(self):
+        import tempfile as tf
+        d = Path(tf.mkdtemp())
+        tr = [mk(0.60, i % 10 < 7, t=i * 600.0) for i in range(123)]
+        (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
+            {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
+             "t": t["ts"], "slug": t["what"][0], "side": "Up", "edge_fill": 0.0}
+            for t in tr]}}}))
+        txt = slip.report(d, "V", None)
+        self.assertIn("Прогноз по 0.50-0.70", txt)
+        self.assertIn("при  250 сделках", txt)
+        self.assertIn("сделок в час", txt)
