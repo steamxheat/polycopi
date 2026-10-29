@@ -316,11 +316,13 @@ class AdverseSelectionTests(unittest.TestCase):
     def test_breakdown_appears_with_enough_rows(self):
         cols = fillcheck.SURV_COLS
         rows = []
-        for i in range(20):                       # слабый рывок — попадаем
-            rows.append({"move_bps": 4.0, "ask0": 0.6, **{f"ok_{t}": 1 for t in HORIZONS_MS},
+        for i in range(40):                       # слабые рывки — попадаем
+            rows.append({"move_bps": 3.0 + i * 0.01, "ask0": 0.6,
+                         **{f"ok_{t}": 1 for t in HORIZONS_MS},
                          **{f"okt_{t}": 1 for t in HORIZONS_MS}})
-        for i in range(20):                       # сильный рывок — не попадаем
-            rows.append({"move_bps": 12.0, "ask0": 0.6, **{f"ok_{t}": 0 for t in HORIZONS_MS},
+        for i in range(40):                       # сильные рывки — не попадаем
+            rows.append({"move_bps": 12.0 + i * 0.01, "ask0": 0.6,
+                         **{f"ok_{t}": 0 for t in HORIZONS_MS},
                          **{f"okt_{t}": 0 for t in HORIZONS_MS}})
         with (self.tmp / "survive.csv").open("w", newline="") as fh:
             w = csv.DictWriter(fh, cols)
@@ -329,11 +331,13 @@ class AdverseSelectionTests(unittest.TestCase):
                 w.writerow({c: r.get(c, "") for c in cols})
         txt = fillcheck.report(self.tmp)
         self.assertIn("сила рывка", txt)
-        self.assertIn("3-5 б.п.", txt)
-        self.assertIn("10+ б.п.", txt)
-        # у слабых 100%, у сильных 0% — обе строки должны быть видны
-        self.assertIn("100%", txt)
-        self.assertIn("0%", txt)
+        self.assertIn("слабее всех", txt)
+        self.assertIn("сильнее всех", txt)
+        # слабые рывки доходят целиком, сильные не доходят вовсе
+        line_weak = next(l for l in txt.splitlines() if "слабее всех" in l)
+        line_strong = next(l for l in txt.splitlines() if "сильнее всех" in l)
+        self.assertIn("100%", line_weak)
+        self.assertIn("0%", line_strong)
 
     def test_breakdown_hidden_when_too_few(self):
         cols = fillcheck.SURV_COLS
@@ -341,7 +345,7 @@ class AdverseSelectionTests(unittest.TestCase):
             w = csv.DictWriter(fh, cols)
             w.writeheader()
             w.writerow({c: 1 for c in cols})
-        self.assertNotIn("3-5 б.п.", fillcheck.report(self.tmp))
+        self.assertIn("мало сигналов для разбивки", fillcheck.report(self.tmp))
 
 
 class DepthTests(unittest.TestCase):
