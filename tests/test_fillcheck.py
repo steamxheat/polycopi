@@ -339,6 +339,21 @@ class AdverseSelectionTests(unittest.TestCase):
         self.assertIn("100%", line_weak)
         self.assertIn("0%", line_strong)
 
+    def test_breakdown_with_identical_move_values(self):
+        """У многих сигналов сила рывка совпадает — сортировка не должна падать."""
+        cols = fillcheck.SURV_COLS
+        with (self.tmp / "survive.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, cols)
+            w.writeheader()
+            for i in range(80):
+                r = {"move_bps": 3.2, "ask0": 0.6,            # одно и то же значение
+                     **{f"ok_{t}": i % 2 for t in HORIZONS_MS},
+                     **{f"okt_{t}": i % 2 for t in HORIZONS_MS}}
+                w.writerow({c: r.get(c, "") for c in cols})
+        txt = fillcheck.report(self.tmp)
+        self.assertIn("сила рывка", txt)
+        self.assertIn("(3.2-3.2)", txt)
+
     def test_breakdown_hidden_when_too_few(self):
         cols = fillcheck.SURV_COLS
         with (self.tmp / "survive.csv").open("w", newline="") as fh:

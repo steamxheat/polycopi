@@ -467,17 +467,20 @@ def report(out: Path) -> str:
         L += ["", "   Не достаются ли нам только плохие сделки? Делим выборку на четыре",
               "   равные части по силе рывка: слабые рывки vs сильные. Если у сильных",
               "   доля попаданий заметно ниже — лучшее забирают до нас.", ""]
-        mv = sorted((abs(f(r.get("move_bps")) or 0.0), r) for r in sv)
+        def strength(r):
+            return abs(f(r.get("move_bps")) or 0.0)
+        mv = sorted(sv, key=strength)        # сортируем ТОЛЬКО по силе: при равных
+        
         q = len(mv) // 4
         if q >= 15:
             L.append(f"{'сила рывка':<22}{'100мс':>8}{'200мс':>8}{'500мс':>8}{'из':>7}")
             for i, name in enumerate(("слабее всех", "ниже среднего",
                                       "выше среднего", "сильнее всех")):
                 grp = mv[i * q:(i + 1) * q] if i < 3 else mv[3 * q:]
-                lo, hi = grp[0][0], grp[-1][0]
+                lo, hi = strength(grp[0]), strength(grp[-1])
                 cells = ""
                 for t in (100, 200, 500):
-                    ys = [r for _, r in grp if r.get(f"okt_{t}") in ("0", "1")]
+                    ys = [r for r in grp if r.get(f"okt_{t}") in ("0", "1")]
                     cells += (f"{sum(r[f'okt_{t}'] == '1' for r in ys) / len(ys):>7.0%} "
                               if ys else f"{'-':>8}")
                 L.append(f"{f'{name} ({lo:.1f}-{hi:.1f})':<22}{cells}{len(grp):>7}")
