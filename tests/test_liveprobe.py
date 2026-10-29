@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import sys
 import tempfile
@@ -201,6 +202,69 @@ class ModelGateTests(unittest.IsolatedAsyncioTestCase):
         import fvsim
         self.assertIs(liveprobe.Prober.model, fvsim.Engine.model)
         self.assertIs(liveprobe.Prober.capture_s0, fvsim.Engine.capture_s0)
+
+
+class SettlementTests(unittest.IsolatedAsyncioTestCase):
+    """Замер тратит настоящие деньги — он обязан знать, чем кончились сделки."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def filled_order(self, won: bool):
+        t = RecordTrader({"ok": True, "status": "matched", "filled": 5.0,
+                          "avg_price": 0.60, "spent": 3.0, "error": "", "note": ""})
+        pr, api, mk = mkp(self.tmp, t, lead_sources=None)
+        await asyncio.sleep(0.01)
+        self.assertEqual(pr.pos["U"], [5.0, 3.0])          # позиция записана
+        # ответ gamma-api закрытого рынка: цены исходов ровно 0/1
+        api.closed[mk.slug] = {"closed": True, "clobTokenIds": '["U", "D"]',
+                               "outcomePrices": '["1", "0"]' if won else '["0", "1"]'}
+        api.t = mk.end + 60
+        return pr, api, mk
+
+    async def test_win_is_credited(self):
+        pr, _, _ = await self.filled_order(won=True)
+        await pr.resolve_markets()
+        self.assertAlmostEqual(pr.realized, 5.0 - 3.0)      # 5 билетов по $1 минус $3
+        self.assertNotIn("U", pr.pos)
+        self.assertEqual(pr.settled, 1)
+
+    async def test_loss_is_recorded(self):
+        pr, _, _ = await self.filled_order(won=False)
+        await pr.resolve_markets()
+        self.assertAlmostEqual(pr.realized, -3.0)
+        self.assertEqual(pr.settled, 1)
+
+    async def test_state_json_readable_by_app(self):
+        """Формат симулятора — тогда приложение читает замер без правок шлюза."""
+        pr, _, _ = await self.filled_order(won=True)
+        await pr.resolve_markets()
+        st = json.loads((self.tmp / "state.json").read_text())
+        self.assertIn("probe", st["variants"])
+        v = st["variants"]["probe"]
+        for k in ("cash", "start_cash", "realized", "pos", "trades"):
+            self.assertIn(k, v)
+        self.assertAlmostEqual(v["realized"], 2.0)
+        self.assertTrue(any(t.get("pnl") is not None or t.get("shares") for t in v["trades"]))
+
+    async def test_trades_csv_in_simulator_format(self):
+        await self.filled_order(won=True)
+        rows = fillcheck.rows(self.tmp / "trades.csv")
+        self.assertEqual(rows[0]["variant"], "probe")
+        self.assertEqual(rows[0]["side"], "Up")
+        self.assertAlmostEqual(float(rows[0]["shares"]), 5.0)
+        self.assertAlmostEqual(float(rows[0]["cost"]), 3.0)
+
+    async def test_unfilled_order_makes_no_position(self):
+        t = RecordTrader({"ok": True, "status": "unmatched", "filled": 0.0,
+                          "avg_price": None, "spent": 0.0, "error": "", "note": ""})
+        pr, _, _ = mkp(self.tmp, t, lead_sources=None)
+        await asyncio.sleep(0.01)
+        self.assertEqual(pr.pos, {})
+        self.assertFalse((self.tmp / "trades.csv").exists())
 
 
 class DryTests(unittest.IsolatedAsyncioTestCase):

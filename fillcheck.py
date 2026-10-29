@@ -131,6 +131,7 @@ class Watcher:
         self.rtt: deque = deque(maxlen=5000)
         self.rest_age: deque = deque(maxlen=5000)
         self.ghost_n = self.rest_n = 0
+        self.started = self.api.now()
         self._rr = 0
         self._csv_checked: set[str] = set()
 
@@ -179,6 +180,9 @@ class Watcher:
 
     def tick_second(self) -> None:
         """Раз в секунду. В замере без денег не нужна, liveprobe считает здесь модель."""
+
+    async def resolve_markets(self) -> None:
+        """Чем кончились окна. Без денег не нужно, liveprobe считает здесь прибыль."""
 
     def _on_price(self, symbol: str, ts: float) -> None:
         """Новая цена с быстрой биржи — сразу проверяем условие и горизонты."""
@@ -346,7 +350,9 @@ class Watcher:
                                    str(m.get("conditionId", "")))
                     self.markets[slug] = mk
                     self.tok_mkt[toks[0]] = self.tok_mkt[toks[1]] = mk
-        for slug in [s for s, m in self.markets.items() if m.end < now - 120]:
+        # 15 минут, а не 2: итоги у Polymarket появляются не сразу, а по ним
+        # считается прибыль купленных билетов — потеряем окно, потеряем позицию
+        for slug in [s for s, m in self.markets.items() if m.end < now - 900]:
             m = self.markets.pop(slug)
             for t in (m.up, m.down):
                 self.tok_mkt.pop(t, None)
@@ -369,7 +375,7 @@ class Watcher:
 # ======================================================================= циклы
 
 async def main_loop(w: Watcher, stop: asyncio.Event):
-    last_disc = last_rest = last_status = last_tick = 0.0
+    last_disc = last_rest = last_status = last_tick = last_res = 0.0
     while not stop.is_set():
         now = time.time()
         try:
@@ -384,6 +390,9 @@ async def main_loop(w: Watcher, stop: asyncio.Event):
             if now - last_rest >= w.cfg["rest_every_s"]:
                 await w.check_rest()
                 last_rest = now
+            if now - last_res >= 10:
+                await w.resolve_markets()
+                last_res = now
         except Exception as e:  # noqa: BLE001
             log.exception(f"loop: {e}")
         if now - last_status >= w.cfg["status_every_s"]:

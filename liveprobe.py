@@ -46,6 +46,8 @@ import statistics
 import time
 from pathlib import Path
 
+from core import resolution_payouts
+
 import fillcheck
 import fvmodel
 import fvsim
@@ -300,6 +302,14 @@ class Prober(fillcheck.Watcher):
         self.inflight: set[str] = set()
         self.halted = ""
         self.sampler = fvmodel.Sampler(self.prices)
+        # Купленные билеты и их судьба. Без этого мы бы потратили настоящие деньги
+        # и не узнали, выиграли они или нет.
+        self.pos: dict[str, list] = {}            # токен -> [билетов, потрачено]
+        self.tok_slug: dict[str, str] = {}
+        self.realized = 0.0
+        self.cash = 0.0                           # прибыль/убыток от старта
+        self.resolve_next: dict[str, float] = {}
+        self.settled = 0
 
     # Расчёт модели берём ТЕМИ ЖЕ функциями, что у рабочего бота, а не копией:
     # копия со временем разошлась бы, и мы калибровали бы не ту стратегию.
@@ -382,7 +392,25 @@ class Prober(fillcheck.Watcher):
         if r.get("note"):
             self.info(f"ВНИМАНИЕ {r['note']}")
         r = {**r, "send_ms": send_ms, "filled": filled, "avg_price": avg, "spent": spent}
+        r = {**r, "slug": sig["mk"].slug, "tok": sig["tok"], "side": sig["side"],
+             "t": sig["t0"], "ask_seen": sig["ask0"], "limit": limit,
+             "edge": sig.get("edge", 0.0)}
         self.results.append(r)
+        if filled > 0:                       # запоминаем позицию до расчёта окна
+            pos = self.pos.setdefault(sig["tok"], [0.0, 0.0])
+            pos[0] += filled
+            pos[1] += spent
+            self.cash -= spent
+            self.tok_slug[sig["tok"]] = sig["mk"].slug
+            self._csv("trades.csv", fvsim.TRADE_COLS, {
+                "time_utc": utc(sig["t0"]), "variant": "probe", "rule": self.cfg["rule"],
+                "asset": sig["mk"].asset, "window": sig["mk"].window, "slug": sig["mk"].slug,
+                "side": sig["side"], "tau": round(sig["mk"].end - sig["t0"], 1),
+                "p_model": "", "seen_ask": sig["ask0"], "fill_vwap": round(avg or limit, 4),
+                "shares": round(filled, 4), "cost": round(spent, 4), "fee": "",
+                "edge_seen": round(sig.get("edge", 0.0), 4), "edge_fill": round(sig.get("edge", 0.0), 4),
+                "book_ms": round(send_ms), "sources": "", "book_age_ms": ""})
+            self.save_state()
         self.count("order_ok" if r["ok"] else "order_fail")
         self.count("order_filled" if filled > 0 else "order_empty")
         self._csv("orders.csv", ORDER_COLS, {
@@ -400,6 +428,57 @@ class Prober(fillcheck.Watcher):
                   f"{send_ms:.0f}мс | всего {self.orders}/{self.cfg['max_orders']}, "
                   f"${self.spent:.2f}/${self.cfg['max_spend_usd']:.2f}"
                   + (f" | {r['error']}" if r.get("error") else ""))
+
+    async def resolve_markets(self):
+        """Чем кончились окна, в которых мы купили билеты. Как в fvsim.resolve."""
+        now = self.api.now()
+        for slug, mk in list(self.markets.items()):
+            if mk.resolved or now < mk.end + 10 or now < self.resolve_next.get(slug, 0):
+                continue
+            self.resolve_next[slug] = now + 15
+            try:
+                info = await self.api.get_market(slug, closed=True)
+            except Exception:  # noqa: BLE001
+                continue
+            pay = resolution_payouts(info) if info else None
+            if not pay:
+                continue
+            mk.resolved = True
+            mk.winner = "Up" if pay.get(mk.up) == 1 else "Down"
+            self._csv("outcomes.csv", fvsim.OUT_COLS,
+                      {"slug": slug, "asset": mk.asset, "window": mk.window,
+                       "start": mk.start, "winner": mk.winner})
+            for tok in (mk.up, mk.down):
+                pos = self.pos.pop(tok, None)
+                if not pos:
+                    continue
+                payout = pos[0] * pay.get(tok, 0)
+                pnl = payout - pos[1]
+                self.realized += pnl
+                self.cash += pnl
+                self.settled += 1
+                self.info(f"ИТОГ {mk.asset.upper()} {mk.window} победил {mk.winner}: "
+                          f"{pnl:+.2f}$ (вложено {pos[1]:.2f}$) | всего {self.realized:+.2f}$ "
+                          f"за {self.settled} расчётов")
+            self.save_state()
+
+    def save_state(self):
+        """Состояние в формате симулятора — тогда приложение читает нас без правок."""
+        tr = []
+        for t in self.results[-200:]:
+            tr.append({"slug": t.get("slug", ""), "tok": t.get("tok", ""), "side": t.get("side", ""),
+                       "t": t.get("t", 0.0), "tau": 0, "p": 0, "seen": t.get("ask_seen", 0),
+                       "vwap": t.get("avg_price") or t.get("limit", 0), "shares": t.get("filled", 0),
+                       "cost": t.get("spent", 0), "edge_seen": t.get("edge", 0),
+                       "edge_fill": t.get("edge", 0), "pnl": t.get("pnl"), "won": t.get("won", False)})
+        start = 0.0
+        (self.out / "state.json").write_text(json.dumps({
+            "started": self.started, "saved": self.api.now(),
+            "counters": dict(self.counters),
+            "variants": {"probe": {"cash": start + self.cash, "start_cash": start,
+                                   "realized": self.realized,
+                                   "pos": {k: v for k, v in self.pos.items()},
+                                   "entries": {}, "trades": tr}}}, ensure_ascii=False))
 
     def status(self):
         super().status()

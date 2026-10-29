@@ -18,6 +18,7 @@ class FakeApi:
     def __init__(self, t=1000.0):
         self.t = t
         self.books = {}
+        self.closed = {}          # slug -> ответ gamma-api закрытого рынка
 
     def now(self):
         return self.t
@@ -25,8 +26,8 @@ class FakeApi:
     async def get_book(self, tok):
         return self.books.get(tok, {})
 
-    async def get_market(self, slug):
-        return None
+    async def get_market(self, slug, closed=False):
+        return self.closed.get(slug)
 
 
 def mkw(tmp, **over):
@@ -155,7 +156,8 @@ class MemoryTests(unittest.TestCase):
     def test_dead_token_marks_are_dropped(self):
         w, api, mk = mkw(self.tmp)
         w.last_signal["U"] = api.t
-        api.t = mk.end + 300                             # окно давно закончилось
+        api.t = mk.end + 1000     # окно давно закончилось (порог очистки 900 с:
+        #                           итоги у Polymarket появляются не сразу)
         asyncio.run(w.discover())
         self.assertNotIn("U", w.last_signal)
         self.assertNotIn("U", w.tok_mkt)
