@@ -398,15 +398,25 @@ async def status(cfg: dict, out: Path):
             print(f"  {name}: {await call()}")
         except Exception as e:  # noqa: BLE001
             print(f"  {name}: не прочитано ({type(e).__name__}: {str(e)[:120]})")
+    # ВАЖНО: list_open_orders отдаёт постраничный итератор. Считать надо ЗАПИСИ
+    # страницы, иначе «1» означает одну страницу, а не одну заявку.
     try:
-        n = 0
-        async for _ in c.list_open_orders():
-            n += 1
-            if n > 50:
-                break
-        print(f"  открытых заявок: {n}")
+        pg = c.list_open_orders()
+        page = await pg.first_page() if hasattr(pg, "first_page") else None
+        items = list(getattr(page, "items", None) or []) if page is not None else None
+        if items is None:                      # запасной путь: обычный обход
+            items = []
+            async for o in pg:
+                items.append(o)
+                if len(items) >= 50:
+                    break
+        print(f"  открытых заявок: {len(items)}")
+        for o in items[:5]:
+            print(f"    {getattr(o, 'id', '?')} {getattr(o, 'side', '')} "
+                  f"{getattr(o, 'price', '')} x{getattr(o, 'size', '')} "
+                  f"{getattr(o, 'asset_id', '')[:12]}")
     except Exception as e:  # noqa: BLE001
-        print(f"  открытые заявки: не прочитано ({type(e).__name__})")
+        print(f"  открытые заявки: не прочитано ({type(e).__name__}: {str(e)[:100]})")
     for m in ("aclose", "close"):
         f = getattr(c, m, None)
         if f:
