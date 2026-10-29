@@ -784,14 +784,100 @@ class BalanceCapTests(unittest.IsolatedAsyncioTestCase):
         await t.buy("TOK", 0.60, 5.0)
         self.assertEqual(got["amount"], "3.00")
 
-    async def test_balance_drops_after_a_fill(self):
+    async def test_balance_is_reread_from_the_exchange(self):
+        """Свой счётчик врёт при частичном исполнении — спрашиваем биржу."""
         t, _ = self._trader(10.0)
-        t._buy_here = lambda *a, **k: _done({"ok": True, "status": "filled", "filled": 5.0,
-                                             "avg_price": 0.6, "spent": 3.0, "sign_ms": 1.0,
-                                             "post_ms": 1.0, "error": "", "note": ""})
+        t.client.get_balance_allowance = lambda **k: _done(type("B", (), {"balance": 7000000})())
         await t.buy("TOK", 0.60, 5.0)
         self.assertAlmostEqual(t.balance, 7.0)
 
 
+class ConfirmTests(unittest.IsolatedAsyncioTestCase):
+    """Горький урок: биржа отвечала «встречных нет», мы писали «потрачено $0»,
+    а со счёта ушло $9. Ответу не верим — сверяем со счётом."""
+
+    def _trader(self, after_balance, reply, trades=()):
+        class C:
+            async def create_market_order(self, **kw):
+                return {"ok": True}
+
+            async def post_order(self, signed):
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+
+            def get_balance_allowance(self, **k):
+                return _done(type("B", (), {"balance": after_balance * 1_000_000})())
+
+            def get_trades(self):
+                return _done(list(trades))
+
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.client = C()
+        t.balance = 10.48
+        return t
+
+    async def test_error_reply_but_money_left_the_account(self):
+        err = RuntimeError("no orders found to match with FAK order")
+        t = self._trader(9.41, err, trades=[{"asset_id": "TOK", "size": 20.0, "price": 0.05}])
+        r = await t.buy("TOK", 0.05, 5.0)
+        self.assertTrue(r["ok"])                       # не промах!
+        self.assertAlmostEqual(r["spent"], 1.07, places=2)
+        self.assertAlmostEqual(r["filled"], 20.0)
+        self.assertAlmostEqual(r["avg_price"], 0.05)
+        self.assertIn("ОТВЕТ СОВРАЛ", r["note"])
+
+    async def test_real_miss_stays_a_miss(self):
+        err = RuntimeError("no orders found to match with FAK order")
+        t = self._trader(10.48, err)                   # счёт не дрогнул
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertFalse(r["ok"])
+        self.assertEqual(r["spent"], 0.0)
+        self.assertNotIn("СОВРАЛ", r.get("note") or "")
+
+    async def test_honest_reply_is_left_alone(self):
+        ok = _reply(making=3_000_000, taking=5_000_000)
+        t = self._trader(7.48, ok)
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertAlmostEqual(r["spent"], 3.0)
+        self.assertNotIn("СОВРАЛ", r.get("note") or "")
+
+    async def test_spent_taken_from_the_account_not_the_reply(self):
+        """Ответ занизил трату — верим счёту."""
+        low = _reply(making=100_000, taking=5_000_000)
+        t = self._trader(8.48, low)                    # ушло $2.00, а в ответе $0.10
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertAlmostEqual(r["spent"], 2.0)
+        self.assertIn("СОВРАЛ", r["note"])
+
+    async def test_unreadable_account_is_said_out_loud(self):
+        class Boom(Exception):
+            pass
+
+        t = self._trader(0, RuntimeError("мимо"))
+        t.client.get_balance_allowance = lambda **k: (_ for _ in ()).throw(Boom())
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertIn("счёт не сверен", r["note"])
+
+
+class MinPriceTests(unittest.TestCase):
+    """Дешёвые билеты не торгуем: все 9 настоящих покупок ушли по 0.05-0.20,
+    а это диапазон, который в разборе держался на случайных попаданиях."""
+
+    def test_floor_is_in_defaults(self):
+        self.assertGreaterEqual(liveprobe.DEFAULTS["min_price"], 0.30)
+
+    def test_cheap_signal_is_skipped(self):
+        src = (Path(__file__).resolve().parent.parent / "liveprobe.py").read_text()
+        self.assertIn('if sig["ask0"] < self.cfg["min_price"]', src)
+
+
 async def _done(v):
     return v
+
+
+def _reply(making: int, taking: int, status: str = "matched"):
+    """Ответ библиотеки — объект с полями, а не словарь."""
+    return type("Accepted", (), {"ok": True, "status": status, "order_id": "x",
+                                 "making_amount": making, "taking_amount": taking,
+                                 "message": ""})()

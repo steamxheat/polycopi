@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import csv
+import inspect
 import threading
 import json
 import os
@@ -74,6 +75,11 @@ DEFAULTS.update({
     # Пока заявка идёт, аск успевает уйти, и по аску+1¢ мы просто не догоняем.
     # Разрешаем переплатить часть своего перевеса, оставив себе min_edge:
     # перевес 8¢ при min_edge 2¢ -> готовы дать до аск+4¢ (половину от 6¢).
+    # Все 9 настоящих покупок ушли по 0.05-0.20 — это тот дешёвый диапазон,
+    # который в разборе прибыли держался на 4 случайных попаданиях. Заодно
+    # из-за минимума заявки $1 на цене 0.05 выходило 20 билетов вместо 5.
+    # Калибруемся там, где перевес доказан: 0.30 и выше.
+    "min_price": 0.30,
     "limit_edge_frac": 0.5,     # какую долю свободного перевеса готовы отдать
     "limit_extra_max": 0.04,    # но не больше этого
     "order_type": "FAK",        # взять что можно и отменить остаток; НЕ оставлять заявку
@@ -140,6 +146,22 @@ def _num(x):
         return float(x)
     except (TypeError, ValueError):
         return None
+
+
+async def _rows(v):
+    """Записи из чего угодно: списка, страницы или итератора."""
+    if inspect.isawaitable(v):
+        v = await v
+    if hasattr(v, "first_page"):
+        v = await v.first_page()
+    items = getattr(v, "items", None)
+    if items is not None:
+        return list(items)
+    if isinstance(v, (list, tuple)):
+        return list(v)
+    if hasattr(v, "__aiter__"):
+        return [x async for x in v]
+    return []
 
 
 def parse_reply(r, limit: float, shares: float) -> dict:
@@ -296,6 +318,60 @@ class LiveTrader:
             log.info(f"Баланс не прочитался: {type(e).__name__}")
         await self.cancel_all("на старте")
 
+    async def confirm(self, tok: str, before: float | None, reply: dict) -> dict:
+        """Проверить по счёту, что заявка НЕ исполнилась.
+
+        Горький урок: биржа отвечала "no orders found to match with FAK order",
+        мы писали "мимо, потрачено $0", а на счёте за это время ушло $9 —
+        заявка успевала исполниться частично, а ошибка приходила на остаток.
+        Ответу больше не верим: спрашиваем счёт.
+        """
+        try:
+            after = await self.read_balance()
+        except Exception as e:  # noqa: BLE001
+            reply["note"] = (reply.get("note") or "") + f" счёт не сверен ({type(e).__name__})"
+            return reply
+        if before is None or after is None:
+            return reply
+        drop = round(before - after, 4)
+        if drop <= 0.004:                        # счёт не изменился — покупки не было
+            return reply
+        if reply.get("spent", 0) >= drop - 0.004:
+            return reply                         # ответ и счёт согласны
+        got = await self.last_fill(tok)
+        reply["spent"] = drop
+        reply["ok"] = True
+        reply["status"] = (reply.get("status") or "") + "+по_счёту"
+        if got:
+            reply["filled"], reply["avg_price"] = got
+        elif reply.get("filled", 0) <= 0:
+            reply["filled"] = round(drop / max(reply.get("limit_used") or 0.5, 0.01), 4)
+        reply["note"] = ((reply.get("note") or "")
+                         + f" ОТВЕТ СОВРАЛ: биржа сказала мимо, а со счёта ушло ${drop:.2f}")
+        return reply
+
+    async def last_fill(self, tok: str) -> tuple[float, float] | None:
+        """Сколько билетов и по какой цене куплено по этому токену (из сделок)."""
+        fn = next((getattr(self.client, n) for n in
+                   ("get_trades", "list_trades", "get_user_trades") if
+                   hasattr(self.client, n)), None)
+        if fn is None:
+            return None
+        try:
+            rows = await self._in_thread(_rows(fn()))
+        except Exception:  # noqa: BLE001
+            return None
+        sz = pr = 0.0
+        for r in rows:
+            d = r if isinstance(r, dict) else getattr(r, "__dict__", {}) or {}
+            if str(d.get("asset_id") or "") != str(tok):
+                continue
+            n = _num(d.get("size")) or 0.0
+            c = _num(d.get("price")) or 0.0
+            sz, pr = sz + n, pr + n * c
+            break                                 # самая свежая сделка идёт первой
+        return (sz, round(pr / sz, 4)) if sz > 0 else None
+
     async def read_balance(self) -> float | None:
         b = await self._in_thread(
             self.client.get_balance_allowance(asset_type="COLLATERAL"))
@@ -356,10 +432,14 @@ class LiveTrader:
             if amount > room:
                 amount = room
                 shares = round(amount / limit, 4)
+        before = self.balance
         r = await self._in_thread(self._buy_here(tok, limit, shares, amount))
         r["shares_sent"] = shares
-        if r.get("spent"):                       # купили — денег стало меньше
-            self.balance = max((self.balance or 0.0) - r["spent"], 0.0)
+        r["limit_used"] = limit
+        # Ответу не верим: всегда сверяем со счётом (см. confirm).
+        r = await self.confirm(tok, before, r)
+        if self.balance is None and r.get("spent"):
+            self.balance = max((before or 0.0) - r["spent"], 0.0)
         return r
 
     async def close(self):
@@ -455,6 +535,9 @@ class Prober(fillcheck.Watcher):
                 self.info(f"СТОП: {stop}. Заявки больше не отправляются, замер продолжается.")
             return
         if sig["tok"] in self.inflight:
+            return
+        if sig["ask0"] < self.cfg["min_price"]:
+            self.count("too_cheap")
             return
         limit = min(sig["ask0"] + self.price_slack(sig.get("edge", 0.0)),
                     self.cfg["max_price"])
@@ -592,7 +675,8 @@ class Prober(fillcheck.Watcher):
         c = self.counters
         s0 = sum(1 for m in self.markets.values() if m.s0)
         self.info(f"ФИЛЬТР модель молчит {c.get('no_model', 0)}, перевес мал "
-                  f"{c.get('low_edge', 0)} | окон со стартовой ценой {s0}/{len(self.markets)} "
+                  f"{c.get('low_edge', 0)}, билет дешевле {self.cfg['min_price']:.2f} "
+                  f"{c.get('too_cheap', 0)} | окон со стартовой ценой {s0}/{len(self.markets)} "
                   f"| порог {self.cfg['min_edge'] * 100:.0f}¢")
         if self.sends:
             fil = sum(1 for r in self.results if r["filled"] > 0)
