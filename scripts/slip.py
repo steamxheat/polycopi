@@ -30,35 +30,32 @@ from sens import load_state  # noqa: E402
 BUCKETS = ((0.0, 0.15), (0.15, 0.30), (0.30, 0.50),
            (0.50, 0.70), (0.70, 0.85), (0.85, 1.01))
 FEE_K = 0.07              # сбор берущего: 0.07 * p * (1-p)
-OUR_SLIP_CAP = 0.04       # выше аск+4¢ мы не платим никогда (limit_extra_max)
+def _our_cap() -> float:
+    """Нашу переплату берём из настроек бота, а не держим копию здесь.
+
+    В отчёте стояло 4¢, когда у бота уже был 1¢, и один проект выдавал
+    разрешающий и запрещающий вывод одновременно.
+    """
+    try:
+        import liveprobe                                 # noqa: PLC0415
+        return float(liveprobe.DEFAULTS["limit_extra_max"])
+    except Exception:                                    # noqa: BLE001
+        return 0.01
+
+
+OUR_SLIP_CAP = _our_cap()
 
 
 def fee(p: float) -> float:
     return FEE_K * p * (1.0 - p)
 
 
-def by_outcome(trades: list[dict]) -> list[dict]:
-    """Повторные покупки одного исхода -> ОДНО наблюдение.
-
-    Исход у них общий, значит это одна ставка, а не несколько проверок. Считать
-    их отдельно — завышать точность и давать удачным окнам лишний вес: по
-    покупкам доля выигрышей выходила 72.4%, по исходам 69.1%.
-
-    Прибыль на билет внутри кластера усредняем по размеру покупок, билеты
-    складываем — так сохраняется и денежный итог, и правильное число
-    независимых наблюдений.
-    """
+def clusters(trades: list[dict]) -> dict[tuple, list[dict]]:
+    """Группы покупок с общим исходом: (рынок, сторона)."""
     g: dict[tuple, list[dict]] = defaultdict(list)
     for t in trades:
         g[(t.get("what") or (t.get("t"),))].append(t)
-    out = []
-    for xs in g.values():
-        sh = sum(x["shares"] for x in xs) or 1.0
-        out.append({"win": xs[0]["win"], "ts": min(x.get("ts") or 0.0 for x in xs),
-                    "vwap": sum(x["vwap"] * x["shares"] for x in xs) / sh,
-                    "shares": sh, "n_buys": len(xs),
-                    "pps": sum(per_share(x) * x["shares"] for x in xs) / sh})
-    return out
+    return g
 
 
 def per_share(t: dict) -> float:
@@ -84,18 +81,47 @@ def z_for(k: int) -> float:
         return 1.96 + 0.52 * math.log(k)
 
 
-def stats(trades: list[dict]) -> dict:
+def stats(trades: list[dict], clustered: bool = True) -> dict:
+    """Прибыль на билет и её погрешность.
+
+    Среднее считается ПО БИЛЕТАМ: это реальный результат стратегии, и
+    пересчитывать его с равным весом исходов нельзя — так меняется сам
+    измеряемый показатель, а не его точность (моя прежняя ошибка: средние
+    8.0¢ вместо настоящих 12.0¢).
+
+    А вот ПОГРЕШНОСТЬ обязана считаться по исходам: пять покупок одного окна
+    делят один исход и независимыми наблюдениями не являются. Это кластерная
+    оценка — среднее остаётся прежним, растёт только разброс.
+    """
     n = len(trades)
     if not n:
         return {"n": 0}
-    xs = [t["pps"] if "pps" in t else per_share(t) for t in trades]
-    m = sum(xs) / n
-    sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
-    se = sd / math.sqrt(n) if n else 0.0
-    return {"n": n, "wins": sum(1 for t in trades if t["win"]),
-            "price": sum(t["vwap"] for t in trades) / n,
-            "slack": m, "se": se,
-            "lo": m - 1.96 * se, "money": sum(x * t["shares"] for x, t in zip(xs, trades))}
+    w_all = sum(t["shares"] for t in trades) or 1.0
+    m = sum(per_share(t) * t["shares"] for t in trades) / w_all      # на билет
+
+    if clustered:
+        gs = clusters(trades)
+        k = len(gs)
+        # остаток по каждому исходу: сколько он дал сверх среднего
+        res = [sum((per_share(t) - m) * t["shares"] for t in xs) for xs in gs.values()]
+        if k < 2:
+            # Один исход — разброс оценить НЕЧЕМ. Любая цифра здесь была бы
+            # выдумкой, поэтому объявляем полную неопределённость.
+            se = abs(m) + 1.0
+        else:
+            var = sum(r * r for r in res) / (w_all * w_all)
+            var *= k / (k - 1)                  # поправка на малое число исходов
+            se = math.sqrt(max(var, 0.0))
+    else:
+        k = n
+        xs = [per_share(t) for t in trades]
+        sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
+        se = sd / math.sqrt(n)
+
+    return {"n": n, "k": k, "wins": sum(1 for t in trades if t["win"]),
+            "price": sum(t["vwap"] * t["shares"] for t in trades) / w_all,
+            "slack": m, "se": se, "lo": m - 1.96 * se,
+            "money": sum(per_share(t) * t["shares"] for t in trades)}
 
 
 def fills(path: Path) -> dict:
@@ -129,9 +155,10 @@ def forecast(s: dict, z: float, target: int) -> float:
     удержится. Неопределённость падает как корень из числа сделок —
     значит граница растёт сама, без улучшения стратегии.
     """
-    if s["n"] < 2 or target <= s["n"]:
+    base = s.get("k") or s["n"]          # считаем в исходах, не в покупках
+    if base < 2 or target <= base:
         return s["lo"]
-    return s["slack"] - z * s["se"] * math.sqrt(s["n"] / target)
+    return s["slack"] - z * s["se"] * math.sqrt(base / target)
 
 
 def pace(trades: list[dict]) -> float:
@@ -144,20 +171,39 @@ def pace(trades: list[dict]) -> float:
     return len(ts) / hours if hours > 0.5 else 0.0
 
 
-def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False) -> str:
+def since_ts(text: str) -> float:
+    """«2026-10-29T15:30» (UTC) -> секунды. Пустая строка -> 0."""
+    if not text:
+        return 0.0
+    from datetime import datetime, timezone                # noqa: PLC0415
+    t = text.strip().replace(" ", "T")
+    for f in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(t, f).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    raise SystemExit(f"Не понял время «{text}». Нужно 2026-10-29T15:30 (UTC).")
+
+
+def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False,
+           since: str = "") -> str:
     hist = load_state(d)
     tr = hist.get(variant)
     if not tr:
         have = ", ".join(sorted(hist)) or "ничего"
         return f"Нет сделок варианта {variant} в {d}. Есть: {have}"
+    cut = since_ts(since)
+    if cut:
+        tr = [t for t in tr if (t.get("ts") or 0) >= cut]
+        if not tr:
+            return f"После {since} у {variant} рассчитанных сделок нет."
     fl = fills(fillpath) if fillpath else {}
     raw_n = len(tr)
-    if not raw:
-        tr = by_outcome(tr)          # единица наблюдения — исход, а не покупка
     nb = sum(1 for b in BUCKETS if any(b[0] <= t["vwap"] < b[1] for t in tr))
-    L = [f"Запас прочности по цене билета — {variant}, "
-         + (f"покупок {raw_n} (зависимость НЕ учтена)" if raw else
-            f"исходов {len(tr)} из {raw_n} покупок"),
+    L = [f"Запас прочности по цене билета — {variant}, покупок {raw_n}"
+         + (" (зависимость НЕ учтена: --raw)" if raw else
+            "; погрешность считается по исходам")
+         + (f"; только после {since} UTC" if since else ""),
          f"Диапазонов с данными {nb}, поэтому нижняя граница берётся с запасом "
          f"{z_for(nb):.2f} сигмы (выбираем лучший из {nb}, а не один заранее названный).",
          ""]
@@ -168,8 +214,10 @@ def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False) -> s
     seen = [b for b in BUCKETS if any(b[0] <= t["vwap"] < b[1] for t in tr)]
     z = z_for(len(seen))
     for b in BUCKETS:
+        # Отбираем ПОКУПКИ по их цене, и лишь затем группируем по исходам:
+        # иначе исход, купленный по 0.60 и 0.80, выпадал из обоих диапазонов.
         part = [t for t in tr if b[0] <= t["vwap"] < b[1]]
-        s = stats(part)
+        s = stats(part, clustered=not raw)
         if not s["n"]:
             continue
         s["lo"] = s["slack"] - z * s["se"]           # с поправкой на выбор лучшего
@@ -180,12 +228,15 @@ def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False) -> s
                  f" ({100 * s['wins'] / s['n']:3.0f}%)   {s['price']:.2f}"
                  f"   {100 * s['slack']:+7.1f}   {100 * s['lo']:+7.1f}"
                  f"        {100 * net:+7.1f}   {s['money']:+8.2f}$   {fs}")
+        if not raw and s.get("k") and s["k"] < s["n"]:
+            L.append(f"               ^ {s['n']} покупок на {s['k']} исходах")
         rows.append((b, s))
     tot = sum(s["money"] for _, s in rows)
     L += ["", f"  деньги — сколько эта строка принесла в симуляции. Всего {tot:+.2f}$.",
           "  запас — на сколько центов можем переплачивать за билет и остаться в нуле.",
           f"  наверняка — нижняя граница с поправкой на выбор лучшего из "
-          f"{nb}: меньше этого не будет.",
+          f"{nb}. Это нижняя ОЦЕНКА (не гарантия): она говорит, что данные "
+          f"не противоречат такому запасу, а не что меньше не будет.",
           f"  после переплаты — что останется, если платим наши "
           f"{100 * OUR_SLIP_CAP:.0f}¢ сверх аска.", ""]
 
@@ -211,14 +262,14 @@ def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False) -> s
                   "Живыми деньгами торговать нечем."]
     elif not good:
         best = max(thin, key=lambda x: x[1]["lo"])
-        L += ["", f"  ИТОГ: перевес есть только тонкий. Лучший — "
-                  f"{best[0][0]:.2f}-{best[0][1]:.2f} ({100 * best[1]['lo']:.1f}¢ наверняка). "
-                  f"Торговать можно, но переплату надо срезать до "
-                  f"{100 * best[1]['lo'] / 2:.0f}¢ и копить сделки."]
+        L += ["", f"  ИТОГ: перевес тонкий. Лучший — "
+                  f"{best[0][0]:.2f}-{best[0][1]:.2f} ({100 * best[1]['lo']:.1f}¢ "
+                  f"по нижней оценке). Торговля НЕ разрешена: нужно либо срезать "
+                  f"переплату до {100 * best[1]['lo'] / 2:.0f}¢, либо копить наблюдения."]
     else:
         lo, hi = good[0][0][0], good[-1][0][1]
-        L += ["", f"  ИТОГ: торговать {lo:.2f}-{hi:.2f}, остальное закрыть "
-                  f"порогами min_price/max_price."]
+        L += ["", f"  ИТОГ: перевес установлен в {lo:.2f}-{hi:.2f}. Это НЕ разрешение "
+                  f"торговать: решение принимается по условиям в docs/HYPOTHESES.md."]
     # Прогноз по лучшему диапазону: когда ждать ответа и каким он будет
     if rows:
         b, best = max(rows, key=lambda x: x[1]["lo"])
@@ -250,8 +301,10 @@ def main():
     ap.add_argument("--fill", type=Path, default=Path("data_fill"))
     ap.add_argument("--raw", action="store_true",
                     help="считать по покупкам, не по исходам (завышает точность)")
+    ap.add_argument("--since", default="",
+                    help="только сделки позже этого времени UTC (2026-10-29T15:30)")
     a = ap.parse_args()
-    print(report(a.dir, a.variant, a.fill if a.fill.exists() else None, a.raw))
+    print(report(a.dir, a.variant, a.fill if a.fill.exists() else None, a.raw, a.since))
 
 
 if __name__ == "__main__":

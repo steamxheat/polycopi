@@ -126,7 +126,8 @@ def report(d: Path, variant: str, lo_p: float, hi_p: float, raw: bool) -> str:
         else:
             v, tag = "не отличить", 0
         if n < MIN_N:
-            tag = 0                                  # по корзине тоже не судим
+            v, tag = "не отличить", 0     # обнулять только признак было ошибкой:
+            #                               в строке оставался прежний вердикт
         verdicts.append((b, n, w, tag))
         L.append(f"  {b[0]:.2f}-{b[1]:.2f}        {n:9d}   {w:4d} ({100 * w / n:3.0f}%)"
                  f"   {100 * lo:3.0f}-{100 * hi:3.0f}%      {v}"
