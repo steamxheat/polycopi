@@ -731,11 +731,15 @@ class PriceSlackTests(unittest.TestCase):
         self.assertAlmostEqual(self._p().price_slack(0.02), 0.01)
 
     def test_big_edge_pays_half_of_what_is_free(self):
-        # перевес 8¢, запас 2¢ -> свободно 6¢ -> отдаём 3¢
-        self.assertAlmostEqual(self._p().price_slack(0.08), 0.03)
+        # перевес 8¢, запас 2¢ -> свободно 6¢ -> отдаём 3¢ (потолок поднят)
+        self.assertAlmostEqual(self._p(limit_extra_max=0.04).price_slack(0.08), 0.03)
 
     def test_never_above_the_cap(self):
-        self.assertAlmostEqual(self._p().price_slack(0.50), 0.04)
+        self.assertAlmostEqual(self._p(limit_extra_max=0.04).price_slack(0.50), 0.04)
+
+    def test_default_cap_is_one_cent(self):
+        """По умолчанию потолок 1¢: доказанный запас всего 1.9¢ на билет."""
+        self.assertAlmostEqual(self._p().price_slack(0.50), 0.01)
 
     def test_never_below_the_floor(self):
         self.assertAlmostEqual(self._p().price_slack(0.0), 0.01)
@@ -881,3 +885,20 @@ def _reply(making: int, taking: int, status: str = "matched"):
     return type("Accepted", (), {"ok": True, "status": status, "order_id": "x",
                                  "making_amount": making, "taking_amount": taking,
                                  "message": ""})()
+
+
+class ProvenRangeTests(unittest.TestCase):
+    """Настройки обязаны совпадать с тем, что доказал запас прочности
+    (scripts/slip.py на 422 сделках): торгуем 0.50-0.70, переплата 1¢."""
+
+    def test_only_the_proven_range_is_tradable(self):
+        self.assertAlmostEqual(liveprobe.DEFAULTS["min_price"], 0.50)
+        self.assertAlmostEqual(liveprobe.DEFAULTS["max_price"], 0.70)
+
+    def test_markup_does_not_eat_the_margin(self):
+        # доказано 1.9¢ наверняка — отдавать больше половины нельзя
+        self.assertLessEqual(liveprobe.DEFAULTS["limit_extra_max"], 0.01)
+
+    def test_dear_signal_is_skipped_too(self):
+        src = (Path(__file__).resolve().parent.parent / "liveprobe.py").read_text()
+        self.assertIn('if limit > self.cfg["max_price"]', src)
