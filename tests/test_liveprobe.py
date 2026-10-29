@@ -3,6 +3,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -665,3 +666,76 @@ class ReportTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrderThreadTests(unittest.IsolatedAsyncioTestCase):
+    """Отправка должна жить в своём потоке: иначе разбор потока стаканов
+    задерживает заявку (подпись прыгала с 8 до 151 мс — ждала очереди)."""
+
+    def _trader(self):
+        import threading
+        seen = {}
+
+        class C:
+            async def create_market_order(self, **kw):
+                seen["sign_thread"] = threading.current_thread().name
+                await asyncio.sleep(0.01)
+                return {"ok": True}
+
+            async def post_order(self, signed):
+                seen["post_thread"] = threading.current_thread().name
+                await asyncio.sleep(0.01)
+                return {"status": "unmatched", "makingAmount": "0", "takingAmount": "0"}
+
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.client = C()
+        t._start_thread()
+        return t, seen
+
+    async def test_client_calls_run_off_the_main_loop(self):
+        import threading
+        t, seen = self._trader()
+        try:
+            await t.buy("TOK", 0.61, 5.0)
+        finally:
+            t.loop.call_soon_threadsafe(t.loop.stop)
+        here = threading.current_thread().name
+        self.assertEqual(seen["sign_thread"], "orders")
+        self.assertEqual(seen["post_thread"], "orders")
+        self.assertNotEqual(seen["sign_thread"], here)
+
+    async def test_busy_main_loop_does_not_inflate_measurement(self):
+        """Главный цикл занят 300 мс — замер заявки обязан остаться честным."""
+        t, _ = self._trader()
+        try:
+            task = asyncio.ensure_future(t.buy("TOK", 0.61, 5.0))
+            await asyncio.sleep(0)
+            time.sleep(0.3)                     # блокируем главный цикл
+            r = await task
+        finally:
+            t.loop.call_soon_threadsafe(t.loop.stop)
+        self.assertLess(r["sign_ms"], 150)
+        self.assertLess(r["post_ms"], 150)
+
+
+class PriceSlackTests(unittest.TestCase):
+    """Сколько готовы переплатить к увиденному аску."""
+
+    def _p(self, **over):
+        cfg = dict(liveprobe.DEFAULTS); cfg.update(over)
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = cfg
+        return pr
+
+    def test_small_edge_pays_only_the_floor(self):
+        self.assertAlmostEqual(self._p().price_slack(0.02), 0.01)
+
+    def test_big_edge_pays_half_of_what_is_free(self):
+        # перевес 8¢, запас 2¢ -> свободно 6¢ -> отдаём 3¢
+        self.assertAlmostEqual(self._p().price_slack(0.08), 0.03)
+
+    def test_never_above_the_cap(self):
+        self.assertAlmostEqual(self._p().price_slack(0.50), 0.04)
+
+    def test_never_below_the_floor(self):
+        self.assertAlmostEqual(self._p().price_slack(0.0), 0.01)

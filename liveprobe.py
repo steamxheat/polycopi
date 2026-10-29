@@ -38,7 +38,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import csv
+import threading
 import json
 import os
 import signal
@@ -68,7 +70,12 @@ DEFAULTS.update({
     "max_orders": 40,           # сколько всего заявок разрешено за запуск
     "max_spend_usd": 20.0,      # сколько всего денег разрешено потратить
     "max_price": 0.95,          # дороже не покупаем никогда
-    "limit_extra": 0.01,        # предел цены = увиденный аск + столько (допуск бота)
+    "limit_extra": 0.01,        # минимальный допуск к цене (аск + столько)
+    # Пока заявка идёт, аск успевает уйти, и по аску+1¢ мы просто не догоняем.
+    # Разрешаем переплатить часть своего перевеса, оставив себе min_edge:
+    # перевес 8¢ при min_edge 2¢ -> готовы дать до аск+4¢ (половину от 6¢).
+    "limit_edge_frac": 0.5,     # какую долю свободного перевеса готовы отдать
+    "limit_extra_max": 0.04,    # но не больше этого
     "order_type": "FAK",        # взять что можно и отменить остаток; НЕ оставлять заявку
     # (у place_limit_order в 0.14 нет order_type — она была бы GTC и повисла бы)
     "signal_gap_s": 20.0,       # на калибровке спешить некуда, экономим заявки
@@ -100,9 +107,9 @@ class DryTrader:
         log.info("СУХОЙ РЕЖИМ: заявки не отправляются, только запись в журнал")
 
     async def buy(self, tok: str, limit: float, shares: float) -> dict:
-        await asyncio.sleep(0)
+        log.info(f"[сухо] купил бы {shares:g} билетов по цене не выше {limit:.2f}")
         return {"ok": True, "status": "dry", "filled": 0.0, "avg_price": None,
-                "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "error": "", "note": ""}
+                "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "error": "", "note": "сухой режим"}
 
     async def close(self):
         pass
@@ -176,6 +183,10 @@ class LiveTrader:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.client = None
+        # Свой цикл в отдельном потоке: иначе разбор потока стаканов задерживает
+        # отправку (подпись прыгала с 8 до 151 мс — задача просто ждала очереди).
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
 
     @staticmethod
     def credentials() -> dict:
@@ -223,9 +234,33 @@ class LiveTrader:
             kw.pop("wallet", None)          # Builder сам выводит и разворачивает кошелёк
         return kw
 
+    def _start_thread(self):
+        ready: concurrent.futures.Future = concurrent.futures.Future()
+
+        def runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self.loop = loop
+            loop.call_soon(ready.set_result, True)
+            loop.run_forever()
+
+        self._thread = threading.Thread(target=runner, daemon=True, name="orders")
+        self._thread.start()
+        ready.result(10)
+
+    async def _in_thread(self, coro):
+        """Выполнить в потоке отправки и дождаться результата.
+
+        Если своего потока нет (тесты, проверки) — выполняем здесь же."""
+        if self.loop is None or not self.loop.is_running():
+            return await coro
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return await asyncio.wrap_future(fut)
+
     async def start(self):
         from polymarket import AsyncSecureClient                 # noqa: PLC0415
 
+        self._start_thread()
         cr = self.credentials()
         if not cr.get("POLYMARKET_PRIVATE_KEY"):
             raise SystemExit("Нет ключа. Положи POLYMARKET_PRIVATE_KEY в ~/.polymarket.env "
@@ -234,21 +269,22 @@ class LiveTrader:
         kinds = [k for k in ("api_key", "wallet") if k in kw]
         log.info("Подключаюсь: приватный ключ"
                  + (f" + {', '.join(kinds)}" if kinds else " (без ключа API — только EOA)"))
-        self.client = await AsyncSecureClient.create(**kw)
+        # клиент создаём в потоке отправки — там он и будет жить
+        self.client = await self._in_thread(AsyncSecureClient.create(**kw))
         log.info(f"Кошелёк подключён, тип {getattr(self.client, 'wallet_type', '?')}")
         await self.preflight()
 
     async def preflight(self):
         """До первой заявки: разрешения, баланс, и снять чужие висящие заявки."""
         try:
-            st = await self.client.get_trading_approvals_state()
+            st = await self._in_thread(self.client.get_trading_approvals_state())
             log.info("Разрешения: " + ("выставлены" if getattr(st, "is_fully_approved", False)
                                        else "НЕ выставлены — запусти liveprobe.py approvals"))
         except Exception as e:  # noqa: BLE001
             log.info(f"Состояние разрешений не прочиталось ({type(e).__name__}); "
                      f"если заявки будут отвергаться — запусти: liveprobe.py approvals")
         try:
-            b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
+            b = await self._in_thread(self.client.get_balance_allowance(asset_type="COLLATERAL"))
             log.info(f"Баланс: {usd(getattr(b, 'balance', None))}")
         except Exception as e:  # noqa: BLE001
             log.info(f"Баланс не прочитался: {type(e).__name__}")
@@ -256,25 +292,20 @@ class LiveTrader:
 
     async def cancel_all(self, when: str):
         try:
-            r = await self.client.cancel_all()
+            r = await self._in_thread(self.client.cancel_all())
             log.info(f"Отмена всех заявок {when}: {r}")
         except Exception as e:  # noqa: BLE001
             log.info(f"Отмена всех заявок {when} не удалась: {type(e).__name__}: {e}")
 
     async def approvals(self):
-        h = await self.client.setup_trading_approvals()
+        h = await self._in_thread(self.client.setup_trading_approvals())
         if hasattr(h, "wait"):
             await h.wait()
         log.info("Разрешения на торговлю выставлены")
 
-    async def buy(self, tok: str, limit: float, shares: float) -> dict:
-        # Для покупки биржа требует СУММУ в долларах, а не количество билетов
-        # ("amount is required for BUY market orders"). Потолок цены задаём отдельно,
-        # поэтому дороже limit не возьмём, а билетов выйдет примерно shares.
-        amount = max(round(shares * limit, 2), self.cfg["min_order_usd"])
-        # Делим отправку на подпись и передачу: подпись считается локально и должна
-        # занимать миллисекунды. Если почти всё время уходит на неё — виновата
-        # библиотека (лишние обращения к серверу), и это чинится.
+    async def _buy_here(self, tok: str, limit: float, shares: float, amount: float) -> dict:
+        """Выполняется В ПОТОКЕ ОТПРАВКИ. Время меряем здесь же, иначе в замер
+        попадёт ожидание главного цикла, а не настоящая задержка биржи."""
         t0 = time.perf_counter()
         try:
             signed = await self.client.create_market_order(
@@ -297,10 +328,18 @@ class LiveTrader:
         out["post_ms"] = (time.perf_counter() - t1) * 1000
         return out
 
+    async def buy(self, tok: str, limit: float, shares: float) -> dict:
+        # Для покупки биржа требует СУММУ в долларах, а не количество билетов
+        # ("amount is required for BUY market orders"). Потолок цены задаём отдельно.
+        amount = max(round(shares * limit, 2), self.cfg["min_order_usd"])
+        return await self._in_thread(self._buy_here(tok, limit, shares, amount))
+
     async def close(self):
         if self.client is None:
             return
         await self.cancel_all("на выходе")
+        if self.loop is not None:
+            self.loop.call_soon_threadsafe(self.loop.stop)
         for m in ("aclose", "close", "__aexit__"):
             f = getattr(self.client, m, None)
             if f is None:
@@ -389,7 +428,8 @@ class Prober(fillcheck.Watcher):
             return
         if sig["tok"] in self.inflight:
             return
-        limit = min(sig["ask0"] + self.cfg["limit_extra"], self.cfg["max_price"])
+        limit = min(sig["ask0"] + self.price_slack(sig.get("edge", 0.0)),
+                    self.cfg["max_price"])
         if limit > self.cfg["max_price"]:
             return
         shares = self.cfg["shares"]
@@ -398,6 +438,17 @@ class Prober(fillcheck.Watcher):
         self.inflight.add(sig["tok"])
         self.orders += 1
         asyncio.ensure_future(self._send(sig, limit, shares))
+
+    def price_slack(self, edge: float) -> float:
+        """На сколько выше увиденного аска согласны купить.
+
+        По аску+1¢ мы не догоняем: за 400 мс лучшее предложение исчезает.
+        Отдаём часть свободного перевеса (перевес минус нужный нам запас),
+        но не меньше limit_extra и не больше limit_extra_max.
+        """
+        free = max(edge - self.cfg["min_edge"], 0.0)
+        want = free * self.cfg["limit_edge_frac"]
+        return max(self.cfg["limit_extra"], min(want, self.cfg["limit_extra_max"]))
 
     async def _send(self, sig: dict, limit: float, shares: float):
         t0 = time.perf_counter()
