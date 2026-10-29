@@ -56,7 +56,37 @@ async def pick_token(api) -> tuple[str, float] | None:
     return None
 
 
-async def run(n: int) -> None:
+async def post_probe(t, tok: str, ask: float, n: int) -> list[float]:
+    """Сколько идёт НАСТОЯЩАЯ отправка заявки бирже.
+
+    Отправляем заявку на покупку по цене 1 цент при рыночной 0.60 и выше:
+    исполниться она не может (никто столько не продаёт), но проходит весь
+    путь до биржи и обратно. Деньги не тратятся — заявка отвергается как
+    «встречных нет», ровно так же, как мы уже видели в живом замере.
+    """
+    out = []
+    for i in range(n):
+        t0 = time.perf_counter()
+        try:
+            signed = await t.client.create_market_order(
+                asset_id=tok, side="BUY", amount="1.00", max_price="0.01",
+                order_type="FAK")
+            t1 = time.perf_counter()
+            r = await t.client.post_order(signed)
+            ms = (time.perf_counter() - t1) * 1000
+            out.append(ms)
+            got = liveprobe.parse_reply(r, 0.01, 100)
+            print(f"  отправка {i + 1}: {ms:.0f}мс  (подпись {(t1 - t0) * 1000:.0f}мс)"
+                  + (f"  исполнено {got['filled']:g} — ПРОВЕРЬ!" if got["filled"] else ""))
+        except Exception as e:  # noqa: BLE001
+            ms = (time.perf_counter() - t0) * 1000
+            out.append(ms)
+            print(f"  отправка {i + 1}: {ms:.0f}мс  отказ: {type(e).__name__}: {str(e)[:70]}")
+        await asyncio.sleep(0.3)
+    return out
+
+
+async def run(n: int, post: int = 0) -> None:
     cfg = dict(liveprobe.DEFAULTS)
     api = Api(cfg)
     t = liveprobe.LiveTrader(cfg)
@@ -91,6 +121,12 @@ async def run(n: int) -> None:
             print(f"  подпись {i + 1}: ошибка {type(e).__name__}: {str(e)[:120]}")
         await asyncio.sleep(0.2)
 
+    posts = []
+    if post:
+        print(f"\n--- настоящая отправка, {post} раз (цена 1¢ при рынке {ask:.2f} —")
+        print("    исполниться не может, деньги не тратятся) ---")
+        posts = await post_probe(t, tok, ask, post)
+
     print()
     if reads:
         print(f"чтение стакана:  медиана {statistics.median(reads):.0f}мс")
@@ -107,16 +143,31 @@ async def run(n: int) -> None:
             print("Первая подпись намного дольше остальных — библиотека что-то")
             print("кэширует. Достаточно «прогреть» её при запуске.")
         else:
-            print("Подпись быстрая. Значит время уходит на саму передачу заявки,")
-            print("и ускорять надо сетевой путь, а не подготовку.")
+            print("Подпись быстрая — время уходит не на подготовку.")
+    if posts:
+        pm = statistics.median(posts)
+        print(f"отправка заявки: медиана {pm:.0f}мс  (быстрее всех {min(posts):.0f}, "
+              f"медленнее всех {max(posts):.0f})")
+        print()
+        rd = statistics.median(reads) if reads else 0
+        print(f"Отправка медленнее чтения в {pm / rd:.0f} раз." if rd else "")
+        if pm > 300:
+            print("Это и есть наш потолок скорости. Преимущество живёт в окне")
+            print("50-100 мс, а заявка идёт втрое-впятеро дольше. Надо либо искать")
+            print("другой путь отправки, либо признать, что эта стратегия недоступна.")
+        else:
+            print("Отправка быстрая — значит те 750 мс в живом замере были не здесь,")
+            print("и надо искать причину в другом месте.")
     await t.close()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Из чего складывается задержка заявки (без отправки)")
     ap.add_argument("--n", type=int, default=5)
+    ap.add_argument("--post", type=int, default=0,
+                    help="сколько раз ОТПРАВИТЬ заявку по цене 1¢ (исполниться не может)")
     a = ap.parse_args()
-    asyncio.run(run(a.n))
+    asyncio.run(run(a.n, a.post))
 
 
 if __name__ == "__main__":
