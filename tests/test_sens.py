@@ -124,6 +124,43 @@ class SensTests(unittest.TestCase):
         self.assertEqual(sens.load_state(self.d), {})
         self.assertIn("trades.csv", sens.report(self.d, min_n=30))
 
+    def test_parse_since_formats(self):
+        self.assertEqual(sens.parse_since("1000"), 1000.0)
+        t = sens.parse_since("2026-10-28T22:00")
+        self.assertIn("28.10 22:00", sens.utc_str(t))
+        self.assertIn("28.10", sens.utc_str(sens.parse_since("2026-10-28")))
+        with self.assertRaises(SystemExit):
+            sens.parse_since("вчера")
+
+    def test_fresh_block_uses_only_trades_after_cutoff(self):
+        """До отсечки вариант выигрывал, после — проигрывает.
+        Проверка на новых данных обязана показать минус."""
+        st = {"variants": {"A": {"trades": []}}}
+        for i in range(40):                         # старые: выигрыши
+            st["variants"]["A"]["trades"].append(
+                {"slug": f"o{i}", "tok": "T", "side": "Up", "t": 1000.0 + i, "shares": 10,
+                 "vwap": 0.80, "cost": 8.1, "edge_fill": 0.01, "pnl": 1.9, "won": True})
+        for i in range(40):                         # новые: проигрыши
+            st["variants"]["A"]["trades"].append(
+                {"slug": f"n{i}", "tok": "T", "side": "Up", "t": 5000.0 + i, "shares": 10,
+                 "vwap": 0.80, "cost": 8.1, "edge_fill": 0.01, "pnl": -8.1, "won": False})
+        (self.d / "state.json").write_text(json.dumps(st))
+        txt = sens.report(self.d, min_n=30, since=4000.0)
+        self.assertIn("ПРОВЕРКА НА НОВЫХ ДАННЫХ", txt)
+        block = txt[txt.index("ЧАСТЬ 0"):txt.index("Прошли проверку")]
+        line = next(l for l in block.splitlines() if l.startswith("A "))
+        self.assertIn("40", line)                   # только новые сделки
+        self.assertIn("-", line)                    # и они в минусе
+        self.assertIn("В плюсе на новых данных: 0 из 1", txt)
+
+    def test_fresh_block_absent_without_since(self):
+        outcomes = [[f"s{i}", "Up"] for i in range(40)]
+        trades = [{"variant": "A", "slug": f"s{i}", "side": "Up", "shares": 10,
+                   "fill_vwap": 0.80, "edge_fill": 0.01,
+                   "time_utc": f"2026-10-28T{i // 2:02d}:00:00"} for i in range(40)]
+        write(self.d, trades, outcomes)
+        self.assertNotIn("ЧАСТЬ 0", sens.report(self.d, min_n=30))
+
     def test_losing_variant_marked(self):
         outcomes = [[f"s{i}", "Up" if i % 2 else "Down"] for i in range(40)]
         trades = [{"variant": "B", "slug": f"s{i}", "side": "Up", "shares": 10,

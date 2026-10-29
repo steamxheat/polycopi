@@ -30,6 +30,21 @@ def fee(p: float, shares: float) -> float:
     return FEE_COEF * p * (1 - p) * shares
 
 
+def parse_since(x: str) -> float:
+    """Момент отсечки: unix-время или 'ГГГГ-ММ-ДДTЧЧ:ММ' (UTC)."""
+    try:
+        return float(x)
+    except ValueError:
+        pass
+    import datetime as _dt                              # noqa: PLC0415
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
+        try:
+            return _dt.datetime.strptime(x, fmt).replace(tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            continue
+    raise SystemExit(f"Не понял момент отсечки: {x}")
+
+
 def load_state(d: Path):
     """Полная история сделок из state.json бота (включая те, что были до смены
     формата trades.csv — тот файл бот отложил в trades_old_*.csv)."""
@@ -46,7 +61,8 @@ def load_state(d: Path):
                 out.setdefault(name, []).append(
                     {"v": name, "shares": float(t["shares"]), "vwap": float(t["vwap"]),
                      "win": bool(t.get("won")), "edge": float(t.get("edge_fill") or 0.0),
-                     "t": f"{float(t['t']):.3f}", "what": (t.get("slug", ""), t.get("side", ""))})
+                     "t": f"{float(t['t']):.3f}", "ts": float(t["t"]),
+                     "what": (t.get("slug", ""), t.get("side", ""))})
             except (TypeError, ValueError, KeyError):
                 continue
     return out
@@ -167,7 +183,38 @@ def drop_best(ts: list[dict], frac: float):
     return s[int(len(s) * frac):]
 
 
-def report(d: Path, min_n: int, source: str = "auto") -> str:
+def fresh_block(trades: dict, since: float, min_n: int) -> list[str]:
+    """Сделки ПОСЛЕ момента, когда вариант был выбран. Это единственная часть
+    данных, которой метод не видел, когда назначал победителя."""
+    L = ["", "ЧАСТЬ 0. ПРОВЕРКА НА НОВЫХ ДАННЫХ (главная)",
+         f"  Только сделки после {utc_str(since)} — после того, как кандидат был",
+         "  зафиксирован. На этих данных выбор уже не мог подстроиться.", "",
+         f"{'вариант':<20} {'сделок':>6} {'PnL $':>8} {'z':>6} {'1-я пол.':>10} {'2-я пол.':>10}"]
+    rows_ = []
+    for v, ts in sorted(trades.items()):
+        new = [t for t in ts if t.get("ts", 0) >= since]
+        if len(new) < max(10, min_n // 4):
+            continue
+        xs = each_pnl(new)
+        h1, h2, _, _ = halves(new)
+        rows_.append((v, len(new), sum(xs), zscore(xs), h1, h2))
+    if not rows_:
+        return L + ["  пока мало новых сделок для вывода"]
+    rows_.sort(key=lambda r: -r[2])
+    for v, n, pnl_, z, h1, h2 in rows_:
+        L.append(f"{v:<20} {n:>6} {pnl_:>+8.1f} {z:>6.1f} {h1:>+10.1f} {h2:>+10.1f}")
+    pos = sum(1 for r in rows_ if r[2] > 0)
+    L += ["", f"  В плюсе на новых данных: {pos} из {len(rows_)}.",
+          "  Это честнее любого z на всей выборке: здесь подгонки быть не могло."]
+    return L
+
+
+def utc_str(ts: float) -> str:
+    import datetime as _dt                              # noqa: PLC0415
+    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%d.%m %H:%M UTC")
+
+
+def report(d: Path, min_n: int, source: str = "auto", since: float | None = None) -> str:
     trades, src = {}, ""
     if source in ("auto", "state"):
         trades, src = load_state(d), "state.json (полная история)"
@@ -216,6 +263,8 @@ def report(d: Path, min_n: int, source: str = "auto") -> str:
         L.append(f"{v:<20} {len(ts):>6} {sum(xs):>+8.1f} {z:>6.1f} {top_share(xs):>6.0f}% "
                  f"{h1:>+10.1f} {h2:>+10.1f} {nd:>7} {eta:>8}  {verdict}")
     pos = sum(1 for ts in big.values() if sum(each_pnl(ts)) > 0)
+    if since is not None:
+        L += fresh_block(trades, since, min_n)
     L += ["", f"Прошли проверку на значимость: {len(proven)} из {len(big)}.",
           f"В плюсе: {pos} из {len(big)}. Если бы это была чистая случайность, "
           f"ожидалось бы около половины.", ""]
@@ -270,9 +319,12 @@ def main():
     ap.add_argument("--min-n", type=int, default=30)
     ap.add_argument("--source", choices=("auto", "state", "csv"), default="auto",
                     help="state.json — вся история; csv — только текущий trades.csv")
+    ap.add_argument("--since", help="показать отдельно сделки после момента, когда кандидат "
+                                    "был зафиксирован (ISO или unix)")
     a = ap.parse_args()
     try:
-        print(report(Path(a.data), a.min_n, a.source))
+        print(report(Path(a.data), a.min_n, a.source,
+                     parse_since(a.since) if a.since else None))
     except BrokenPipeError:            # вывод обрезали через | head — это не ошибка
         os._exit(0)
 
