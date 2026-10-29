@@ -18,6 +18,7 @@ import liveprobe  # noqa: E402
 
 DOC = (ROOT / "docs" / "HANDOFF.md").read_text()
 HYP = (ROOT / "docs" / "HYPOTHESES.md").read_text()
+STR = (ROOT / "docs" / "STRATEGY.md").read_text()
 
 
 class SettingsMatchTheCodeTests(unittest.TestCase):
@@ -105,6 +106,53 @@ class CompletenessTests(unittest.TestCase):
                    for _ in re.finditer(r"\n    def test_", p.read_text()))
         self.assertGreaterEqual(max(said) + 15, real,
                                 f"в документе {max(said)}, а тестов уже {real}")
+
+
+class StrategyDocTests(unittest.TestCase):
+    """STRATEGY.md объясняет замысел человеку или другому ИИ. Он обязан
+    содержать и то, где идея ломается, иначе это реклама, а не описание."""
+
+    def test_entry_conditions_match_the_code(self):
+        self.assertIn(f"{liveprobe.DEFAULTS['min_price']:.2f}–"
+                      f"{liveprobe.DEFAULTS['max_price']:.2f}", STR)
+        self.assertIn(f"{liveprobe.DEFAULTS['min_edge'] * 100:.0f} цента", STR)
+        self.assertIn(liveprobe.DEFAULTS["rule"], STR)
+
+    def test_mechanism_is_explained(self):
+        for s in ("Bybit", "OKX", "базисных пункта", "устаревшей цене"):
+            self.assertIn(s, STR)
+
+    def test_failure_modes_are_explained(self):
+        """Шесть мест, где идея ломается, должны быть названы."""
+        for s in ("Отбор", "Асимметрия", "съедает перевес",
+                  "лучшего из многих", "Потолок", "64%"):
+            self.assertIn(s, STR)
+
+    def test_it_does_not_promise_profit(self):
+        """В описании замысла не должно быть обещаний заработка."""
+        for s in ("гарант", "обязательно заработ", "точно заработ"):
+            self.assertNotIn(s, STR)
+
+    def test_old_fake_figures_appear_only_as_a_warning(self):
+        """Суммы «+$207» и «+$131» упоминать можно — но только как пример
+        самообмана, иначе новый читатель примет их за достижение."""
+        for fig in ("+$207", "+$131"):
+            if fig not in STR:
+                continue
+            i = STR.index(fig)
+            near = STR[max(0, i - 400):i + 400]
+            self.assertTrue(
+                any(w in near for w in ("самообман", "в реальности не было",
+                                        "выдумк", "удача")),
+                f"{fig} упомянуто без опровержения")
+
+    def test_the_honest_verdict_is_there(self):
+        self.assertIn("торговать нельзя", STR)
+        self.assertIn("тонкий", STR)
+
+    def test_how_to_check_without_losing_money(self):
+        for s in ("slip.py", "HYPOTHESES.md", "fillcheck.py", "выписка со счёта"):
+            self.assertIn(s, STR)
 
 
 if __name__ == "__main__":
