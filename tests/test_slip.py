@@ -103,8 +103,8 @@ class ReportTests(unittest.TestCase):
         d = Path(td)
         (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
             {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
-             "t": t["ts"], "slug": t["what"][0], "side": "Up", "edge_fill": 0.0}
-            for t in trades]}}}))
+             "t": t["ts"] + i, "slug": f"m{i}", "side": "Up", "edge_fill": 0.0}
+            for i, t in enumerate(trades)]}}}))
         return d
 
     def test_cheap_bucket_called_empty(self):
@@ -159,8 +159,8 @@ class MoneyColumnTests(unittest.TestCase):
         d = Path(tf.mkdtemp())
         (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
             {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
-             "t": t["ts"], "slug": t["what"][0], "side": "Up", "edge_fill": 0.0}
-            for t in trades]}}}))
+             "t": t["ts"] + i, "slug": f"m{i}", "side": "Up", "edge_fill": 0.0}
+            for i, t in enumerate(trades)]}}}))
         return d
 
     def test_money_is_shown_per_bucket(self):
@@ -237,9 +237,48 @@ class ForecastTests(unittest.TestCase):
         tr = [mk(0.60, i % 10 < 7, t=i * 600.0) for i in range(123)]
         (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
             {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
-             "t": t["ts"], "slug": t["what"][0], "side": "Up", "edge_fill": 0.0}
-            for t in tr]}}}))
+             "t": t["ts"] + i, "slug": f"m{i}", "side": "Up", "edge_fill": 0.0}
+            for i, t in enumerate(tr)]}}}))
         txt = slip.report(d, "V", None)
         self.assertIn("Прогноз по 0.50-0.70", txt)
         self.assertIn("при  250 сделках", txt)
         self.assertIn("сделок в час", txt)
+
+
+class OutcomeUnitTests(unittest.TestCase):
+    """Единица наблюдения — ИСХОД, а не покупка. 29.10 бот купил ETH Up пять
+    раз в одном окне; это одна ставка, а не пять проверок."""
+
+    def test_repeat_buys_become_one_observation(self):
+        tr = [dict(mk(0.60, False), what=("eth15", "Up")) for _ in range(5)]
+        obs = slip.by_outcome(tr)
+        self.assertEqual(len(obs), 1)
+        self.assertEqual(obs[0]["n_buys"], 5)
+
+    def test_tickets_are_kept(self):
+        tr = [dict(mk(0.60, True, shares=5.0), what=("a", "Up")) for _ in range(3)]
+        self.assertAlmostEqual(slip.by_outcome(tr)[0]["shares"], 15.0)
+
+    def test_money_is_preserved(self):
+        tr = [dict(mk(0.60, True, shares=5.0), what=("a", "Up")),
+              dict(mk(0.60, True, shares=5.0), what=("a", "Up"))]
+        self.assertAlmostEqual(slip.stats(slip.by_outcome(tr))["money"],
+                               slip.stats(tr)["money"], places=6)
+
+    def test_repeat_buys_no_longer_inflate_precision(self):
+        """Пять покупок одного исхода давали se как от пяти наблюдений."""
+        one = [dict(mk(0.60, True, shares=5.0), what=(f"m{i}", "Up")) for i in range(20)]
+        pad = one + [dict(mk(0.60, True, shares=5.0), what=("m0", "Up")) for _ in range(20)]
+        self.assertEqual(slip.stats(slip.by_outcome(pad))["n"], 20)
+        self.assertEqual(slip.stats(pad)["n"], 40)
+
+    def test_report_says_which_unit_it_used(self):
+        import tempfile as tf
+        d = Path(tf.mkdtemp())
+        tr = [mk(0.60, i % 10 < 7, t=i * 600.0) for i in range(60)]
+        (d / "state.json").write_text(json.dumps({"variants": {"V": {"trades": [
+            {"shares": t["shares"], "vwap": t["vwap"], "won": t["win"], "pnl": 1.0,
+             "t": t["ts"], "slug": f"m{i}", "side": "Up", "edge_fill": 0.0}
+            for i, t in enumerate(tr)]}}}))
+        self.assertIn("исходов", slip.report(d, "V", None))
+        self.assertIn("зависимость НЕ учтена", slip.report(d, "V", None, raw=True))

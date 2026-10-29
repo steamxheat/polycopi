@@ -20,6 +20,7 @@ import argparse
 import csv
 import math
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -34,6 +35,30 @@ OUR_SLIP_CAP = 0.04       # выше аск+4¢ мы не платим нико�
 
 def fee(p: float) -> float:
     return FEE_K * p * (1.0 - p)
+
+
+def by_outcome(trades: list[dict]) -> list[dict]:
+    """Повторные покупки одного исхода -> ОДНО наблюдение.
+
+    Исход у них общий, значит это одна ставка, а не несколько проверок. Считать
+    их отдельно — завышать точность и давать удачным окнам лишний вес: по
+    покупкам доля выигрышей выходила 72.4%, по исходам 69.1%.
+
+    Прибыль на билет внутри кластера усредняем по размеру покупок, билеты
+    складываем — так сохраняется и денежный итог, и правильное число
+    независимых наблюдений.
+    """
+    g: dict[tuple, list[dict]] = defaultdict(list)
+    for t in trades:
+        g[(t.get("what") or (t.get("t"),))].append(t)
+    out = []
+    for xs in g.values():
+        sh = sum(x["shares"] for x in xs) or 1.0
+        out.append({"win": xs[0]["win"], "ts": min(x.get("ts") or 0.0 for x in xs),
+                    "vwap": sum(x["vwap"] * x["shares"] for x in xs) / sh,
+                    "shares": sh, "n_buys": len(xs),
+                    "pps": sum(per_share(x) * x["shares"] for x in xs) / sh})
+    return out
 
 
 def per_share(t: dict) -> float:
@@ -63,7 +88,7 @@ def stats(trades: list[dict]) -> dict:
     n = len(trades)
     if not n:
         return {"n": 0}
-    xs = [per_share(t) for t in trades]
+    xs = [t["pps"] if "pps" in t else per_share(t) for t in trades]
     m = sum(xs) / n
     sd = math.sqrt(sum((x - m) ** 2 for x in xs) / (n - 1)) if n > 1 else 0.0
     se = sd / math.sqrt(n) if n else 0.0
@@ -119,15 +144,20 @@ def pace(trades: list[dict]) -> float:
     return len(ts) / hours if hours > 0.5 else 0.0
 
 
-def report(d: Path, variant: str, fillpath: Path | None) -> str:
+def report(d: Path, variant: str, fillpath: Path | None, raw: bool = False) -> str:
     hist = load_state(d)
     tr = hist.get(variant)
     if not tr:
         have = ", ".join(sorted(hist)) or "ничего"
         return f"Нет сделок варианта {variant} в {d}. Есть: {have}"
     fl = fills(fillpath) if fillpath else {}
+    raw_n = len(tr)
+    if not raw:
+        tr = by_outcome(tr)          # единица наблюдения — исход, а не покупка
     nb = sum(1 for b in BUCKETS if any(b[0] <= t["vwap"] < b[1] for t in tr))
-    L = [f"Запас прочности по цене билета — {variant}, сделок {len(tr)}",
+    L = [f"Запас прочности по цене билета — {variant}, "
+         + (f"покупок {raw_n} (зависимость НЕ учтена)" if raw else
+            f"исходов {len(tr)} из {raw_n} покупок"),
          f"Диапазонов с данными {nb}, поэтому нижняя граница берётся с запасом "
          f"{z_for(nb):.2f} сигмы (выбираем лучший из {nb}, а не один заранее названный).",
          ""]
@@ -218,8 +248,10 @@ def main():
     ap.add_argument("dir", type=Path)
     ap.add_argument("--variant", default="lag3-1s-t60")
     ap.add_argument("--fill", type=Path, default=Path("data_fill"))
+    ap.add_argument("--raw", action="store_true",
+                    help="считать по покупкам, не по исходам (завышает точность)")
     a = ap.parse_args()
-    print(report(a.dir, a.variant, a.fill if a.fill.exists() else None))
+    print(report(a.dir, a.variant, a.fill if a.fill.exists() else None, a.raw))
 
 
 if __name__ == "__main__":
