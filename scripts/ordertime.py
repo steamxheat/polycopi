@@ -30,29 +30,34 @@ from mmsim import Api  # noqa: E402
 
 
 async def pick_token(api) -> tuple[str, float] | None:
-    """Любой живой рынок BTC/ETH: берём токен и текущий аск."""
+    """Любой живой рынок BTC/ETH: берём токен с нормальной ценой.
+
+    Смотрим обе стороны и текущее с предыдущим окном: у только что начавшегося
+    окна стакана может ещё не быть, а у одной из сторон цена бывает на краю.
+    """
+    from core import _as_list                                # noqa: PLC0415
+    from mmsim import best                                   # noqa: PLC0415
+
     now = api.now()
     for asset in ("btc", "eth"):
         for win, dur in (("5m", 300), ("15m", 900)):
-            slug = f"{asset}-updown-{win}-{int(now // dur * dur)}"
-            try:
-                m = await api.get_market(slug)
-            except Exception:  # noqa: BLE001
-                continue
-            if not m:
-                continue
-            from core import _as_list                       # noqa: PLC0415
-            toks = [str(t) for t in _as_list(m.get("clobTokenIds"))]
-            if not toks:
-                continue
-            try:
-                bk = await api.get_book(toks[0])
-            except Exception:  # noqa: BLE001
-                continue
-            from mmsim import best                          # noqa: PLC0415
-            a = best(bk, "asks")[0]
-            if a and 0.05 < a < 0.95:
-                return toks[0], a
+            cur = int(now // dur * dur)
+            for start in (cur, cur - dur):
+                slug = f"{asset}-updown-{win}-{start}"
+                try:
+                    m = await api.get_market(slug)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not m:
+                    continue
+                for tok in [str(t) for t in _as_list(m.get("clobTokenIds"))]:
+                    try:
+                        bk = await api.get_book(tok)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    a = best(bk, "asks")[0]
+                    if a and 0.10 <= a <= 0.90:
+                        return tok, a
     return None
 
 
@@ -94,7 +99,8 @@ async def run(n: int, post: int = 0) -> None:
 
     found = await pick_token(api)
     if not found:
-        raise SystemExit("Не нашёл живой рынок с нормальной ценой — попробуй через минуту")
+        raise SystemExit("Не нашёл живой рынок с ценой в диапазоне 0.10-0.90.\n"
+                         "Так бывает в тихие минуты — попробуй через минуту-две.")
     tok, ask = found
     limit = min(ask + 0.01, 0.95)
     amount = max(round(5 * limit, 2), 1.0)
