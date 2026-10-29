@@ -304,6 +304,46 @@ class LoggingTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class AdverseSelectionTests(unittest.TestCase):
+    """Разбивка по силе рывка: слабые рывки доходят, сильные забирают до нас."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_breakdown_appears_with_enough_rows(self):
+        cols = fillcheck.SURV_COLS
+        rows = []
+        for i in range(20):                       # слабый рывок — попадаем
+            rows.append({"move_bps": 4.0, "ask0": 0.6, **{f"ok_{t}": 1 for t in HORIZONS_MS},
+                         **{f"okt_{t}": 1 for t in HORIZONS_MS}})
+        for i in range(20):                       # сильный рывок — не попадаем
+            rows.append({"move_bps": 12.0, "ask0": 0.6, **{f"ok_{t}": 0 for t in HORIZONS_MS},
+                         **{f"okt_{t}": 0 for t in HORIZONS_MS}})
+        with (self.tmp / "survive.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, cols)
+            w.writeheader()
+            for r in rows:
+                w.writerow({c: r.get(c, "") for c in cols})
+        txt = fillcheck.report(self.tmp)
+        self.assertIn("сила рывка", txt)
+        self.assertIn("3-5 б.п.", txt)
+        self.assertIn("10+ б.п.", txt)
+        # у слабых 100%, у сильных 0% — обе строки должны быть видны
+        self.assertIn("100%", txt)
+        self.assertIn("0%", txt)
+
+    def test_breakdown_hidden_when_too_few(self):
+        cols = fillcheck.SURV_COLS
+        with (self.tmp / "survive.csv").open("w", newline="") as fh:
+            w = csv.DictWriter(fh, cols)
+            w.writeheader()
+            w.writerow({c: 1 for c in cols})
+        self.assertNotIn("3-5 б.п.", fillcheck.report(self.tmp))
+
+
 class DepthTests(unittest.TestCase):
     """Потолок по объёму: стакан 30 билетов по 60¢, 50 по 61¢, 100 по 65¢."""
 
