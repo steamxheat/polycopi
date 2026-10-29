@@ -223,28 +223,51 @@ class ParseReplyTests(unittest.TestCase):
         self.assertEqual(r["filled"], 0.0)
         self.assertEqual(r["spent"], 0.0)
 
-    def test_unplausible_units_are_flagged_not_trusted(self):
-        """making_amount в микродолларах дал бы цену 609 — такую нельзя принимать."""
-        class Weird:
+    def test_micro_units_are_converted(self):
+        """Как отдаёт библиотека на самом деле: обе суммы в микроединицах.
+        Баланс 10480989 = $10.48 — отсюда и видно масштаб."""
+        class Micro:
+            ok = True
+            order_id = "x"
+            status = "matched"
+            taking_amount = "5000000"        # 5 билетов
+            making_amount = "3050000"        # $3.05
+        r = liveprobe.parse_reply(Micro(), limit=0.61, shares=5)
+        self.assertAlmostEqual(r["filled"], 5.0)
+        self.assertAlmostEqual(r["spent"], 3.05, places=4)
+        self.assertAlmostEqual(r["avg_price"], 0.61, places=4)
+        self.assertEqual(r["note"], "")
+
+    def test_plain_units_still_work(self):
+        class Plain:
             ok = True
             order_id = "x"
             status = "matched"
             taking_amount = "5"
-            making_amount = "3050000"
-        r = liveprobe.parse_reply(Weird(), limit=0.61, shares=5)
+            making_amount = "3.05"
+        r = liveprobe.parse_reply(Plain(), limit=0.61, shares=5)
+        self.assertAlmostEqual(r["filled"], 5.0)
+        self.assertAlmostEqual(r["spent"], 3.05, places=4)
+
+    def test_truly_impossible_price_is_rejected(self):
+        """Цена билета не может быть больше доллара — такому ответу не верим."""
+        class Bad:
+            ok = True
+            order_id = "x"
+            status = "matched"
+            taking_amount = "5"
+            making_amount = "50"             # $10 за билет — так не бывает
+        r = liveprobe.parse_reply(Bad(), limit=0.61, shares=5)
         self.assertIsNone(r["avg_price"])
         self.assertIn("единицы ответа непонятны", r["note"])
         self.assertAlmostEqual(r["spent"], 5 * 0.61, places=3)   # считаем по пределу
 
-    def test_more_filled_than_asked_is_flagged(self):
-        class Weird:
-            ok = True
-            order_id = "x"
-            status = "matched"
-            taking_amount = "5000000"
-            making_amount = "3.05"
-        r = liveprobe.parse_reply(Weird(), limit=0.61, shares=5)
-        self.assertIn("больше заказанных", r["note"])
+    def test_to_units_and_usd(self):
+        self.assertAlmostEqual(liveprobe.to_units(10480989, 1e4), 10.480989)
+        self.assertAlmostEqual(liveprobe.to_units(10.48, 1e4), 10.48)   # уже в долларах
+        self.assertIsNone(liveprobe.to_units(None, 5))
+        self.assertEqual(liveprobe.usd(10480989), "$10.48")
+        self.assertEqual(liveprobe.usd(None), "?")
 
     def test_partial_fill(self):
         class Part:

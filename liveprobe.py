@@ -91,6 +91,25 @@ class DryTrader:
         pass
 
 
+SCALE = 1_000_000          # библиотека считает суммы в микроединицах (6 знаков)
+
+
+def to_units(x, expect_max: float):
+    """Приводит микроединицы к долларам/штукам.
+
+    Баланс приходит как 10480989 = $10.48, значит и количества в ответах на
+    заявки будут такими же. Если число на порядки больше ожидаемого — делим.
+    """
+    if x is None:
+        return None
+    return x / SCALE if abs(x) > max(expect_max, 1.0) * 100 else x
+
+
+def usd(x) -> str:
+    v = to_units(_num(x), 1e4)
+    return f"${v:,.2f}" if v is not None else "?"
+
+
 def _num(x):
     """Decimal/строка/None -> float или None."""
     try:
@@ -108,8 +127,8 @@ def parse_reply(r, limit: float, shares: float) -> dict:
     считаем её неизвестной и честно говорим об этом, а трату берём по пределу.
     """
     ok = bool(getattr(r, "ok", False))
-    filled = _num(getattr(r, "taking_amount", None)) or 0.0
-    paid = _num(getattr(r, "making_amount", None))
+    filled = to_units(_num(getattr(r, "taking_amount", None)), shares) or 0.0
+    paid = to_units(_num(getattr(r, "making_amount", None)), shares)
     avg = paid / filled if (paid and filled > 0) else None
     note = ""
     if avg is not None and not (0.0 < avg <= 1.0):
@@ -123,7 +142,8 @@ def parse_reply(r, limit: float, shares: float) -> dict:
             "filled": filled, "avg_price": avg, "spent": spent,
             "order_id": str(getattr(r, "order_id", "") or ""),
             "error": "" if ok else str(getattr(r, "message", ""))[:200],
-            "note": note, "raw_taking": filled, "raw_making": _num(getattr(r, "making_amount", None))}
+            "note": note, "raw_taking": _num(getattr(r, "taking_amount", None)),
+            "raw_making": _num(getattr(r, "making_amount", None))}
 
 
 class LiveTrader:
@@ -205,13 +225,14 @@ class LiveTrader:
         """До первой заявки: разрешения, баланс, и снять чужие висящие заявки."""
         try:
             st = await self.client.get_trading_approvals_state()
-            log.info(f"Разрешения на торговлю: {st}")
+            log.info("Разрешения: " + ("выставлены" if getattr(st, "is_fully_approved", False)
+                                       else "НЕ выставлены — запусти liveprobe.py approvals"))
         except Exception as e:  # noqa: BLE001
             log.info(f"Состояние разрешений не прочиталось ({type(e).__name__}); "
                      f"если заявки будут отвергаться — запусти: liveprobe.py approvals")
         try:
             b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
-            log.info(f"Баланс/разрешение: {b}")
+            log.info(f"Баланс: {usd(getattr(b, 'balance', None))}")
         except Exception as e:  # noqa: BLE001
             log.info(f"Баланс не прочитался: {type(e).__name__}")
         await self.cancel_all("на старте")
@@ -392,12 +413,17 @@ async def status(cfg: dict, out: Path):
     print("=== Связь с Polymarket ===")
     print(f"  кошелёк:     {getattr(c, 'wallet', '?')}")
     print(f"  тип:         {getattr(c, 'wallet_type', '?')}")
-    for name, call in (("баланс (pUSD)", lambda: c.get_balance_allowance(asset_type="COLLATERAL")),
-                       ("разрешения", lambda: c.get_trading_approvals_state())):
-        try:
-            print(f"  {name}: {await call()}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  {name}: не прочитано ({type(e).__name__}: {str(e)[:120]})")
+    try:
+        b = await c.get_balance_allowance(asset_type="COLLATERAL")
+        print(f"  баланс:      {usd(getattr(b, 'balance', None))}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  баланс: не прочитан ({type(e).__name__}: {str(e)[:120]})")
+    try:
+        st = await c.get_trading_approvals_state()
+        full = getattr(st, "is_fully_approved", None)
+        print(f"  разрешения:  {'✅ выставлены' if full else '❌ НЕ выставлены (нужен approvals)'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  разрешения: не прочитаны ({type(e).__name__})")
     # ВАЖНО: list_open_orders отдаёт постраничный итератор. Считать надо ЗАПИСИ
     # страницы, иначе «1» означает одну страницу, а не одну заявку.
     try:
