@@ -425,6 +425,20 @@ class CredentialsTests(unittest.TestCase):
             del os.environ["POLYMARKET_RELAYER_API_KEY"]
 
 
+class StatusTests(unittest.TestCase):
+    def test_status_is_in_commands_and_sends_no_orders(self):
+        """status обязан быть только для чтения: ни одного вызова заявок."""
+        src = (ROOT / "liveprobe.py").read_text()
+        i = src.index("\nasync def status(")          # именно функция, не метод класса
+        body = src[i:src.index("\nasync def approvals(", i)]
+        self.assertGreater(len(body), 200, "не нашли тело команды status")
+        for forbidden in ("place_market_order", "place_limit_order", "post_order", "buy("):
+            self.assertNotIn(forbidden, body, f"status не должен вызывать {forbidden}")
+        self.assertIn("get_balance_allowance", body)
+        self.assertIn("get_trading_approvals_state", body)
+        self.assertIn('"status"', src)          # есть в списке команд
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

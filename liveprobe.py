@@ -16,6 +16,7 @@
 
 РЕЖИМЫ
   check    — что умеет установленная библиотека (без сети и без ключей)
+  status   — только чтение: кошелёк, баланс, разрешения. Заявок НЕ отправляет
   dry      — всё как вживую, но заявки НЕ отправляются (ключи не нужны)
   live     — настоящие заявки. Нужны ключи и баланс, см. ТРЕБОВАНИЯ ниже.
   report   — отчёт по уже собранному
@@ -377,6 +378,46 @@ async def run(cfg: dict, out: Path, live: bool):
     pr.info(f"Остановлено. Отчёт: python3 liveprobe.py report --out {out}")
 
 
+async def status(cfg: dict, out: Path):
+    """Только чтение: подключиться, показать кошелёк, баланс и разрешения.
+    Ни одной заявки не отправляется."""
+    fvsim.setup_logging(out, cfg, quiet=False)
+    t = LiveTrader(cfg)
+    from polymarket import AsyncSecureClient                     # noqa: PLC0415
+
+    cr = t.credentials()
+    if not cr.get("POLYMARKET_PRIVATE_KEY"):
+        raise SystemExit("Нет POLYMARKET_PRIVATE_KEY в ~/.polymarket.env")
+    c = await AsyncSecureClient.create(**t.client_kwargs(cr))
+    print("=== Связь с Polymarket ===")
+    print(f"  кошелёк:     {getattr(c, 'wallet', '?')}")
+    print(f"  тип:         {getattr(c, 'wallet_type', '?')}")
+    for name, call in (("баланс (pUSD)", lambda: c.get_balance_allowance(asset_type="COLLATERAL")),
+                       ("разрешения", lambda: c.get_trading_approvals_state())):
+        try:
+            print(f"  {name}: {await call()}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {name}: не прочитано ({type(e).__name__}: {str(e)[:120]})")
+    try:
+        n = 0
+        async for _ in c.list_open_orders():
+            n += 1
+            if n > 50:
+                break
+        print(f"  открытых заявок: {n}")
+    except Exception as e:  # noqa: BLE001
+        print(f"  открытые заявки: не прочитано ({type(e).__name__})")
+    for m in ("aclose", "close"):
+        f = getattr(c, m, None)
+        if f:
+            try:
+                await f()
+                break
+            except Exception:  # noqa: BLE001
+                pass
+    print("\nЕсли кошелёк и баланс прочитались — связь есть, ключи рабочие.")
+
+
 async def approvals(cfg: dict, out: Path):
     fvsim.setup_logging(out, cfg, quiet=False)
     t = LiveTrader(cfg)
@@ -540,7 +581,7 @@ def report(out: Path) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="Калибровка исполнения настоящими крошечными заявками")
-    ap.add_argument("cmd", choices=("check", "dry", "live", "approvals", "report"))
+    ap.add_argument("cmd", choices=("check", "status", "dry", "live", "approvals", "report"))
     ap.add_argument("--out", default=str(HERE / "data_probe"))
     ap.add_argument("--config", default=str(HERE / "probe_config.json"))
     ap.add_argument("--max-orders", type=int)
@@ -563,6 +604,9 @@ def main():
         if v is not None:
             cfg[k] = v
     out.mkdir(parents=True, exist_ok=True)
+    if a.cmd == "status":
+        asyncio.run(status(cfg, out))
+        return
     if a.cmd == "approvals":
         asyncio.run(approvals(cfg, out))
         return
