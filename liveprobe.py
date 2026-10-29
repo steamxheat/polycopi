@@ -299,6 +299,9 @@ async def approvals(cfg: dict, out: Path):
 # ======================================================================= check
 
 EXPECTED = ["place_limit_order", "post_order", "setup_trading_approvals"]
+# аргументы, без которых живой режим опасен: без order_type заявка может остаться
+# висеть на рынке (GTC) вместо «взять что есть и отменить остаток»
+NEED_ARGS = {"place_limit_order": ("asset_id", "side", "price", "size", "order_type")}
 
 
 def check() -> str:
@@ -313,15 +316,37 @@ def check() -> str:
     cl = getattr(polymarket, "AsyncSecureClient", None)
     if cl is None:
         return "\n".join(L + ["НЕТ класса AsyncSecureClient — библиотека не та, что ожидается."])
+    import inspect                                        # noqa: PLC0415
     have = {m: hasattr(cl, m) for m in EXPECTED}
-    for m, ok in have.items():
-        L.append(f"  {'✅' if ok else '❌'} {m}")
     missing = [m for m, ok in have.items() if not ok]
+    bad_args: list[str] = []
+    for m, ok in have.items():
+        if not ok:
+            L.append(f"  ❌ {m} — метода нет")
+            continue
+        try:
+            sig = inspect.signature(getattr(cl, m))
+            names = set(sig.parameters)
+        except (TypeError, ValueError):
+            L.append(f"  ⚠️ {m} — подпись не читается, проверить вручную")
+            continue
+        need = NEED_ARGS.get(m, ())
+        lost = [a for a in need if a not in names and "kwargs" not in str(sig)]
+        if lost:
+            bad_args.append(f"{m}: нет {', '.join(lost)}")
+            L.append(f"  ❌ {m}{sig}")
+        else:
+            L.append(f"  ✅ {m}" + (f" (есть {', '.join(need)})" if need else ""))
     L.append("")
-    L.append("Все нужные методы на месте — можно запускать dry, потом live."
-             if not missing else
-             f"ОТСУТСТВУЮТ: {', '.join(missing)}. Живой режим НЕ запускать: "
-             f"надо сверить вызовы с документацией установленной версии.")
+    if missing or bad_args:
+        L.append("ЖИВОЙ РЕЖИМ НЕ ЗАПУСКАТЬ:")
+        if missing:
+            L.append(f"  отсутствуют методы: {', '.join(missing)}")
+        for b in bad_args:
+            L.append(f"  не те аргументы — {b}")
+        L.append("  надо сверить вызовы с документацией установленной версии.")
+    else:
+        L.append("Все нужные методы и аргументы на месте — можно dry, потом live.")
     cr = LiveTrader.credentials()
     L.append("")
     L.append("ключ найден: " + ("да" if cr.get("POLYMARKET_PRIVATE_KEY") else
@@ -418,8 +443,9 @@ def main():
         asyncio.run(approvals(cfg, out))
         return
     if a.cmd == "live":
-        print(check())
-        if "ОТСУТСТВУЮТ" in check() or "НЕ УСТАНОВЛЕНА" in check():
+        ch = check()
+        print(ch)
+        if "НЕ ЗАПУСКАТЬ" in ch or "НЕ УСТАНОВЛЕНА" in ch:
             raise SystemExit("Живой режим не запускаю: сначала починить библиотеку (см. выше).")
     try:
         asyncio.run(run(cfg, out, live=a.cmd == "live"))

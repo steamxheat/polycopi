@@ -190,6 +190,60 @@ class CheckTests(unittest.TestCase):
             del os.environ["POLYMARKET_PRIVATE_KEY"]
 
 
+class CheckSignatureTests(unittest.TestCase):
+    """check должен ловить не только пропавшие методы, но и не те аргументы:
+    без order_type заявка осталась бы висеть на рынке как GTC."""
+
+    def setUp(self):
+        import types
+        self.mod = types.ModuleType("polymarket")
+        self.mod.__version__ = "9.9.9"
+        self.saved = sys.modules.get("polymarket")
+
+    def tearDown(self):
+        if self.saved is None:
+            sys.modules.pop("polymarket", None)
+        else:
+            sys.modules["polymarket"] = self.saved
+
+    def install(self, cls):
+        self.mod.AsyncSecureClient = cls
+        sys.modules["polymarket"] = self.mod
+        return liveprobe.check()
+
+    def test_full_signature_passes(self):
+        class Good:
+            def place_limit_order(self, asset_id, side, price, size, order_type="GTC"): ...
+            def post_order(self, o): ...
+            def setup_trading_approvals(self): ...
+        txt = self.install(Good)
+        self.assertIn("можно dry, потом live", txt)
+        self.assertNotIn("НЕ ЗАПУСКАТЬ", txt)
+
+    def test_missing_order_type_blocks_live(self):
+        class Bad:
+            def place_limit_order(self, asset_id, side, price, size): ...
+            def post_order(self, o): ...
+            def setup_trading_approvals(self): ...
+        txt = self.install(Bad)
+        self.assertIn("НЕ ЗАПУСКАТЬ", txt)
+        self.assertIn("нет order_type", txt)
+
+    def test_missing_method_blocks_live(self):
+        class Bad:
+            def post_order(self, o): ...
+        txt = self.install(Bad)
+        self.assertIn("НЕ ЗАПУСКАТЬ", txt)
+        self.assertIn("отсутствуют методы", txt)
+
+    def test_kwargs_signature_accepted(self):
+        class Flexible:
+            def place_limit_order(self, **kwargs): ...
+            def post_order(self, o): ...
+            def setup_trading_approvals(self): ...
+        self.assertNotIn("НЕ ЗАПУСКАТЬ", self.install(Flexible))
+
+
 class ReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
