@@ -79,6 +79,13 @@ DEFAULTS.update({
     # а надо считать в ДОЛЯХ СЧЁТА. Три предела ниже — следствие того дня.
     "risk_frac": 0.02,          # не больше 2% счёта на одну сделку
     "day_loss_frac": 0.15,      # потеряли 15% счёта за запуск -> стоп
+    # Предохранители от НЕИЗВЕСТНОЙ поломки. Сегодняшняя беда была не в
+    # проигрышах, а в том, что мы проигрывали не зная: биржа отвечала "мимо",
+    # а деньги уходили. Поэтому ловим не только серию неудач, но и любое
+    # расхождение нашего учёта со счётом.
+    "stop_after_losses": 6,     # 6 промахов подряд при 74% попаданий — 0.03%
+    "max_drift_usd": 0.50,      # счёт разошёлся с журналом сильнее -> стоп
+    "warmup_orders": 5,         # после первых N заявок встать и ждать проверки
     # Разбор запаса прочности (scripts/slip.py, 422 сделки): перевес доказан
     # ТОЛЬКО в 0.50-0.70 — 113 сделок, 74% попаданий. Пять остальных
     # диапазонов "в среднем в плюсе", но с поправкой на выбор лучшего из шести
@@ -367,7 +374,8 @@ class LiveTrader:
         if reply.get("spent", 0) >= drop - 0.004:
             return reply                         # ответ и счёт согласны
         got = await self.last_fill(tok)
-        reply["spent"] = drop
+        reply["reply_spent"] = reply.get("spent", 0.0)   # что СКАЗАЛ ответ
+        reply["spent"] = drop                            # что было НА САМОМ ДЕЛЕ
         reply["ok"] = True
         reply["status"] = (reply.get("status") or "") + "+по_счёту"
         if got:
@@ -526,6 +534,8 @@ class Prober(fillcheck.Watcher):
         self.trader = trader
         self.orders = 0
         self.spent = 0.0
+        self.losses_row = 0            # промахов подряд
+        self.drift = 0.0               # накопленное расхождение счёта с журналом
         self.sends: list[float] = []
         self.results: list[dict] = []
         self.inflight: set[str] = set()
@@ -583,6 +593,32 @@ class Prober(fillcheck.Watcher):
             if v and v > 0:
                 tr[tok] = v
 
+    def halt(self, why: str) -> None:
+        """Встать и больше не отправлять заявок. Ставим и файл STOP, чтобы
+        остановка пережила перезапуск: иначе pm2 поднимет бота обратно."""
+        if self.halted:
+            return
+        self.halted = why
+        self.info(f"АВАРИЙНЫЙ СТОП: {why}")
+        try:
+            (self.out / self.cfg["stop_file"]).write_text(f"{utc(self.api.now())} {why}\n")
+        except OSError as e:
+            self.info(f"файл {self.cfg['stop_file']} не записался ({e}) — "
+                      f"остановка только до перезапуска")
+
+    def check_drift(self, expected: float, actual: float) -> None:
+        """Журнал против счёта. Любое расхождение — признак того, что мы не
+        понимаем, что делает бот; именно так ушли $8.98."""
+        d = abs(actual - expected)
+        if d < 0.005:
+            return
+        self.drift += d
+        self.info(f"РАСХОЖДЕНИЕ: по журналу ${expected:.2f}, по счёту ${actual:.2f} "
+                  f"(всего ${self.drift:.2f})")
+        if self.drift >= self.cfg["max_drift_usd"]:
+            self.halt(f"счёт разошёлся с журналом на ${self.drift:.2f} — "
+                      f"бот тратит не то, что записывает")
+
     def budget_left(self) -> str:
         cfg = self.cfg
         if self.halted:
@@ -591,6 +627,12 @@ class Prober(fillcheck.Watcher):
             return f"найден файл {cfg['stop_file']}"
         if self.orders >= cfg["max_orders"]:
             return f"исчерпан лимит заявок ({cfg['max_orders']})"
+        # Разгон: первые заявки бот делает и встаёт, чтобы человек посмотрел
+        # журнал и сверил со счётом, прежде чем дать работать дальше.
+        w = cfg["warmup_orders"]
+        if w and self.orders >= w:
+            return (f"разгон: сделано {self.orders} заявок — проверь журнал и счёт "
+                    f"(python3 scripts/account.py), потом подними warmup_orders")
         if self.spent >= cfg["max_spend_usd"]:
             return f"исчерпан лимит суммы (${cfg['max_spend_usd']:.2f})"
         # Предел потерь в ДОЛЯХ счёта. Лимит в $150 при счёте $10.48 не защищал
@@ -663,6 +705,10 @@ class Prober(fillcheck.Watcher):
         avg = r.get("avg_price")
         spent = float(r.get("spent") or 0.0)
         self.spent += spent
+        # Журнал против счёта: расхождение означает, что мы не понимаем,
+        # что делает бот. Ровно так ушли $8.98 при записи "потрачено $0.00".
+        if "reply_spent" in r:
+            self.check_drift(float(r["reply_spent"] or 0.0), spent)
         if r.get("note"):
             self.info(f"ВНИМАНИЕ {r['note']}")
         r = {**r, "send_ms": send_ms, "filled": filled, "avg_price": avg, "spent": spent}
@@ -734,6 +780,11 @@ class Prober(fillcheck.Watcher):
                 self.realized += pnl
                 self.cash += pnl
                 self.settled += 1
+                self.losses_row = self.losses_row + 1 if pnl < 0 else 0
+                if self.losses_row >= self.cfg["stop_after_losses"]:
+                    self.halt(f"{self.losses_row} промахов подряд — при наших "
+                              f"попаданиях это слишком редкий случай, "
+                              f"скорее поломка, чем неудача")
                 self.info(f"ИТОГ {mk.asset.upper()} {mk.window} победил {mk.winner}: "
                           f"{pnl:+.2f}$ (вложено {pos[1]:.2f}$) | всего {self.realized:+.2f}$ "
                           f"за {self.settled} расчётов")

@@ -1065,3 +1065,88 @@ class ExchangeMinimumTests(unittest.IsolatedAsyncioTestCase):
         pr.cfg = dict(liveprobe.DEFAULTS)
         pr.trader = liveprobe.DryTrader()
         await pr.on_new_market(type("M", (), {"up": "U", "down": "D"})())
+
+
+class SafetyStopTests(unittest.TestCase):
+    """Три предохранителя от НЕИЗВЕСТНОЙ поломки. Сегодня мы проигрывали,
+    не зная об этом: биржа отвечала «мимо», а деньги уходили."""
+
+    def _probe(self, **over):
+        cfg = dict(liveprobe.DEFAULTS); cfg.update(over)
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = cfg
+        pr.halted = ""
+        pr.spent = 0.0
+        pr.orders = 0
+        pr.losses_row = 0
+        pr.drift = 0.0
+        pr.out = Path(tempfile.mkdtemp())
+        pr.api = type("A", (), {"now": staticmethod(lambda: 1_700_000_000.0)})()
+        pr.trader = type("T", (), {"start_balance": 150.0})()
+        pr.info = lambda *a, **k: None
+        return pr
+
+    # --- 1) серия промахов
+    def test_losing_streak_stops_the_bot(self):
+        pr = self._probe()
+        for _ in range(6):
+            pr.losses_row += 1
+        pr.losses_row = 6
+        pr.halt("6 промахов подряд")
+        self.assertIn("промахов", pr.halted)
+
+    def test_streak_threshold_is_rare_not_three(self):
+        """При 74% попаданий три промаха подряд — 1.8%, то есть несколько раз
+        в сутки. Порог должен быть редким, иначе бот встанет на ровном месте."""
+        self.assertGreaterEqual(liveprobe.DEFAULTS["stop_after_losses"], 5)
+
+    # --- 2) расхождение счёта с журналом
+    def test_drift_within_a_cent_is_ignored(self):
+        pr = self._probe()
+        pr.check_drift(3.00, 3.00)
+        self.assertEqual(pr.halted, "")
+
+    def test_small_drift_accumulates_then_stops(self):
+        pr = self._probe(max_drift_usd=0.50)
+        pr.check_drift(1.00, 1.20)             # +0.20
+        self.assertEqual(pr.halted, "")
+        pr.check_drift(1.00, 1.20)             # +0.20 -> 0.40
+        self.assertEqual(pr.halted, "")
+        pr.check_drift(1.00, 1.20)             # -> 0.60
+        self.assertIn("разошёлся с журналом", pr.halted)
+
+    def test_todays_bug_would_have_stopped_it(self):
+        """Ответ сказал $0.00, со счёта ушло $1.07 — стоп на первой же сделке."""
+        pr = self._probe()
+        pr.check_drift(0.00, 1.07)
+        self.assertIn("разошёлся", pr.halted)
+
+    # --- 3) разгон
+    def test_warmup_stops_after_the_first_orders(self):
+        pr = self._probe(warmup_orders=5)
+        pr.orders = 5
+        self.assertIn("разгон", pr.budget_left())
+
+    def test_warmup_lets_the_first_orders_through(self):
+        pr = self._probe(warmup_orders=5)
+        pr.orders = 4
+        self.assertEqual(pr.budget_left(), "")
+
+    def test_warmup_can_be_switched_off(self):
+        pr = self._probe(warmup_orders=0)
+        pr.orders = 99
+        self.assertNotIn("разгон", pr.budget_left())
+
+    # --- остановка должна пережить перезапуск
+    def test_halt_writes_the_stop_file(self):
+        pr = self._probe()
+        pr.halt("проверка")
+        f = pr.out / pr.cfg["stop_file"]
+        self.assertTrue(f.exists())
+        self.assertIn("проверка", f.read_text())
+
+    def test_halt_does_not_overwrite_the_first_reason(self):
+        pr = self._probe()
+        pr.halt("первая причина")
+        pr.halt("вторая")
+        self.assertEqual(pr.halted, "первая причина")
