@@ -117,6 +117,25 @@
       "move_s": 1,
       "ask_stale_s": 1,
       "max_book_age_ms": 200
+    },
+    {
+      "name": "lag3-t60-mid",
+      "min_edge": 0.02,
+      "rule": "t60",
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_stale_s": 1,
+      "min_ask": 0.5,
+      "max_ask": 0.7
+    },
+    {
+      "name": "lag3-t60-cheap",
+      "min_edge": 0.02,
+      "rule": "t60",
+      "move_bps": 3,
+      "move_s": 1,
+      "ask_stale_s": 1,
+      "max_ask": 0.3
     }
   ],
   "use_binance_ws": false,
