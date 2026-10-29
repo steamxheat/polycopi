@@ -41,6 +41,7 @@ class RecordTrader:
 
 def mkp(tmp, trader, **over):
     cfg = dict(liveprobe.DEFAULTS)
+    cfg["use_model"] = False        # эти тесты про механику заявок, модель отдельно
     cfg.update(over)
     api = FakeApi()
     pr = Prober(cfg, api, tmp, trader)
@@ -156,6 +157,50 @@ class LimitTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertEqual(len(t.sent), 1)              # одна в полёте — вторую не шлём
         await asyncio.sleep(0.1)
+
+
+class ModelGateTests(unittest.IsolatedAsyncioTestCase):
+    """Заявка уходит только если модель согласна — как у lag3-1s-t60."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    async def test_no_order_when_model_silent(self):
+        t = RecordTrader()
+        pr, _, _ = mkp(self.tmp, t, lead_sources=None, use_model=True)
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(t.sent), 0)              # модели нет -> не стреляем
+        self.assertGreaterEqual(pr.counters["no_model"], 1)
+
+    async def test_no_order_when_edge_too_small(self):
+        t = RecordTrader()
+        pr, _, _ = mkp(self.tmp, t, lead_sources=None, use_model=True, min_edge=0.02,
+                       signal_gap_s=0.0)
+        pr.model_edge = lambda mk, side, ask: 0.005      # перевес всего полцента
+        pr.check_signals()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(t.sent), 0)
+        self.assertGreaterEqual(pr.counters["low_edge"], 1)
+
+    async def test_order_goes_when_edge_is_enough(self):
+        t = RecordTrader()
+        pr, _, _ = mkp(self.tmp, t, lead_sources=None, use_model=True, min_edge=0.02,
+                       signal_gap_s=0.0)
+        pr.model_edge = lambda mk, side, ask: 0.05       # перевес 5 центов
+        pr.check_signals()
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(t.sent), 1)
+        r = fillcheck.rows(self.tmp / "orders.csv")[0]
+        self.assertAlmostEqual(float(r["edge"]), 0.05)
+
+    def test_model_borrowed_from_working_bot(self):
+        """Расчёт должен быть ТОТ ЖЕ, что у fvsim, а не копией."""
+        import fvsim
+        self.assertIs(liveprobe.Prober.model, fvsim.Engine.model)
+        self.assertIs(liveprobe.Prober.capture_s0, fvsim.Engine.capture_s0)
 
 
 class DryTests(unittest.IsolatedAsyncioTestCase):

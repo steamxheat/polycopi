@@ -47,6 +47,7 @@ import time
 from pathlib import Path
 
 import fillcheck
+import fvmodel
 import fvsim
 import mmsim
 from mmsim import Api, utc
@@ -56,7 +57,7 @@ HERE = Path(__file__).resolve().parent
 
 ORDER_COLS = ["time_utc", "mode", "asset", "window", "side", "tok", "ask_seen", "limit",
               "shares", "send_ms", "ok", "status", "filled", "avg_price", "spent",
-              "move_bps", "ask_age_s", "error"]
+              "move_bps", "ask_age_s", "edge", "error"]
 
 DEFAULTS = dict(fillcheck.DEFAULTS)
 DEFAULTS.update({
@@ -68,6 +69,15 @@ DEFAULTS.update({
     "order_type": "FAK",        # взять что можно и отменить остаток; НЕ оставлять заявку
     # (у place_limit_order в 0.14 нет order_type — она была бы GTC и повисла бы)
     "signal_gap_s": 20.0,       # на калибровке спешить некуда, экономим заявки
+    # условие входа один в один с lag3-1s-t60 — проверяем ТУ стратегию, что дала результат
+    "use_model": True,          # без модели это другая стратегия, не наша
+    "rule": "t60",              # правило расчёта Polymarket (средняя за последние 60 с)
+    "min_edge": 0.02,           # покупаем, только если модель выше цены на 2 цента
+    "sigma_window_s": 900,
+    "sigma_floor": 2e-5,
+    "min_sources": 1,
+    "taker_fee_coef": 0.07,
+    "min_tau": 8,
     "stop_file": "STOP",        # появился файл с таким именем — больше не отправляем
 })
 
@@ -289,6 +299,31 @@ class Prober(fillcheck.Watcher):
         self.results: list[dict] = []
         self.inflight: set[str] = set()
         self.halted = ""
+        self.sampler = fvmodel.Sampler(self.prices)
+
+    # Расчёт модели берём ТЕМИ ЖЕ функциями, что у рабочего бота, а не копией:
+    # копия со временем разошлась бы, и мы калибровали бы не ту стратегию.
+    model = fvsim.Engine.model
+    _src_funcs = fvsim.Engine._src_funcs
+    capture_s0 = fvsim.Engine.capture_s0
+
+    def tick_second(self) -> None:
+        self.sampler.tick(self.api.now())
+        self.capture_s0()
+
+    def model_edge(self, mk, side: str, ask: float):
+        """Перевес модели над ценой, как в fvsim.decide(). None — если модель молчит."""
+        mo = self.model(mk)
+        if mo is None:
+            self.count("no_model")
+            return None
+        pr = mo[0]
+        rule = self.cfg["rule"]
+        if rule not in pr:
+            self.count("no_rule")
+            return None
+        p = pr[rule] if side == "Up" else 1 - pr[rule]
+        return p - ask - fvsim.fee(ask, self.cfg["taker_fee_coef"])
 
     def budget_left(self) -> str:
         cfg = self.cfg
@@ -303,6 +338,14 @@ class Prober(fillcheck.Watcher):
         return ""
 
     def on_signal(self, sig: dict) -> None:
+        if self.cfg.get("use_model"):
+            edge = self.model_edge(sig["mk"], sig["side"], sig["ask0"])
+            if edge is None:                 # модель молчит — стратегия бы не покупала
+                return
+            if edge < self.cfg["min_edge"]:
+                self.count("low_edge")
+                return
+            sig["edge"] = edge
         stop = self.budget_left()
         if stop:
             if not self.halted:
@@ -349,8 +392,10 @@ class Prober(fillcheck.Watcher):
             "send_ms": round(send_ms), "ok": int(r["ok"]), "status": r.get("status", ""),
             "filled": round(filled, 4), "avg_price": round(avg, 4) if avg is not None else "",
             "spent": round(spent, 4), "move_bps": round(sig["mv"], 2),
-            "ask_age_s": round(sig["age"], 2), "error": r.get("error", "")})
-        self.info(f"ЗАЯВКА {sig['mk'].asset.upper()} {sig['side']} по {limit:.2f} "
+            "ask_age_s": round(sig["age"], 2), "edge": round(sig.get("edge", 0.0), 4),
+            "error": r.get("error", "")})
+        self.info(f"ЗАЯВКА {sig['mk'].asset.upper()} {sig['side']} перевес "
+                  f"{sig.get('edge', 0) * 100:+.1f}¢ по {limit:.2f} "
                   f"({shares:g} шт) -> {'взяли' if filled else 'мимо'} {filled:g} за "
                   f"{send_ms:.0f}мс | всего {self.orders}/{self.cfg['max_orders']}, "
                   f"${self.spent:.2f}/${self.cfg['max_spend_usd']:.2f}"

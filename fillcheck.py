@@ -177,6 +177,9 @@ class Watcher:
         rs = self.rets(asset) if rets is None else rets
         return sum(1 for x in rs if sgn * x >= self.cfg["move_bps"]) >= need
 
+    def tick_second(self) -> None:
+        """Раз в секунду. В замере без денег не нужна, liveprobe считает здесь модель."""
+
     def _on_price(self, symbol: str, ts: float) -> None:
         """Новая цена с быстрой биржи — сразу проверяем условие и горизонты."""
         now = self.api.now()
@@ -366,10 +369,13 @@ class Watcher:
 # ======================================================================= циклы
 
 async def main_loop(w: Watcher, stop: asyncio.Event):
-    last_disc = last_rest = last_status = 0.0
+    last_disc = last_rest = last_status = last_tick = 0.0
     while not stop.is_set():
         now = time.time()
         try:
+            if now - last_tick >= 1.0:
+                w.tick_second()
+                last_tick = now
             if now - last_disc >= 5:
                 await w.discover()
                 last_disc = now
