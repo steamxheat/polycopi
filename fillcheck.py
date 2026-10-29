@@ -223,9 +223,15 @@ class Watcher:
                 if now - self.last_signal.get(tok, 0) < cfg["signal_gap_s"]:
                     continue
                 self.last_signal[tok] = now
-                self.pending.append({"tok": tok, "ask0": a, "t0": now, "mv": mv, "age": age,
-                                     "mk": mk, "side": side, "ok": {}, "okt": {}})
+                sig = {"tok": tok, "ask0": a, "t0": now, "mv": mv, "age": age,
+                       "mk": mk, "side": side, "ok": {}, "okt": {}}
+                self.pending.append(sig)
                 self.count("signals")
+                self.on_signal(sig)
+
+    def on_signal(self, sig: dict) -> None:
+        """Точка подключения: liveprobe отправляет здесь настоящую заявку.
+        В замере без денег не делает ничего."""
 
     def resolve_pending(self):
         """Горизонты считаем ПО ИСТОРИИ аска, а не в момент опроса: иначе
