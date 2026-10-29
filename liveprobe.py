@@ -70,6 +70,11 @@ DEFAULTS.update({
     "min_order_usd": 1.0,       # не меньше доллара, иначе биржа отвергнет мелочь
     "max_orders": 40,           # сколько всего заявок разрешено за запуск
     "max_spend_usd": 20.0,      # сколько всего денег разрешено потратить
+    # Урок $8.98: минимум заявки $1 при счёте $10.48 — это 10% счёта на сделку.
+    # Девять сделок = 90% счёта за 23 минуты. Бот считал в билетах и долларах,
+    # а надо считать в ДОЛЯХ СЧЁТА. Три предела ниже — следствие того дня.
+    "risk_frac": 0.02,          # не больше 2% счёта на одну сделку
+    "day_loss_frac": 0.15,      # потеряли 15% счёта за запуск -> стоп
     # Разбор запаса прочности (scripts/slip.py, 422 сделки): перевес доказан
     # ТОЛЬКО в 0.50-0.70 — 113 сделок, 74% попаданий. Пять остальных
     # диапазонов "в среднем в плюсе", но с поправкой на выбор лучшего из шести
@@ -214,6 +219,7 @@ class LiveTrader:
         # Свой цикл в отдельном потоке: иначе разбор потока стаканов задерживает
         # отправку (подпись прыгала с 8 до 151 мс — задача просто ждала очереди).
         self.balance: float | None = None     # долларов на счёте, None = не прочитан
+        self.start_balance: float | None = None   # с чего начали — от него считаем предел потерь
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
 
@@ -314,7 +320,15 @@ class LiveTrader:
                      f"если заявки будут отвергаться — запусти: liveprobe.py approvals")
         try:
             await self.read_balance()
+            self.start_balance = self.balance
             log.info(f"Баланс: {usd(self.balance)}")
+            cap = self.cfg["risk_frac"] * (self.balance or 0)
+            if self.balance and cap < self.cfg["min_order_usd"]:
+                log.info(f"ВНИМАНИЕ: {self.cfg['risk_frac'] * 100:.0f}% от "
+                         f"{usd(self.balance)} = ${cap:.2f}, а минимум заявки "
+                         f"${self.cfg['min_order_usd']:.2f}. Заявки отправляться НЕ будут: "
+                         f"нужен счёт хотя бы "
+                         f"${self.cfg['min_order_usd'] / self.cfg['risk_frac']:.0f}.")
             need = self.cfg["shares"] * self.cfg["max_price"]
             if self.balance is not None and self.balance < need:
                 log.info(f"ВНИМАНИЕ: на {self.cfg['shares']:g} билетов по верхней цене нужно "
@@ -435,6 +449,21 @@ class LiveTrader:
                         "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "note": "",
                         "error": f"не хватает денег: на счёте {usd(self.balance)}, "
                                  f"минимум заявки ${self.cfg['min_order_usd']:.2f}"}
+            # Доля счёта. Если задуманная ставка не влезает в неё из-за минимума
+            # заявки — НЕ торгуем. Раздувать ставку до минимума нельзя: именно так
+            # $0.25 превратились в $1, то есть 2% счёта в 10%.
+            cap = round(self.balance * self.cfg["risk_frac"], 2)
+            if amount > cap:
+                if cap < self.cfg["min_order_usd"]:
+                    return {"ok": False, "status": "too_big", "filled": 0.0,
+                            "avg_price": None, "spent": 0.0, "sign_ms": 0.0,
+                            "post_ms": 0.0, "note": "",
+                            "error": f"ставка не влезает в риск: {self.cfg['risk_frac'] * 100:.0f}% "
+                                     f"от {usd(self.balance)} = ${cap:.2f}, а минимум заявки "
+                                     f"${self.cfg['min_order_usd']:.2f}. Нужен счёт хотя бы "
+                                     f"${self.cfg['min_order_usd'] / self.cfg['risk_frac']:.0f}."}
+                amount = cap
+                shares = round(amount / limit, 4)
             if amount > room:
                 amount = room
                 shares = round(amount / limit, 4)
@@ -523,7 +552,18 @@ class Prober(fillcheck.Watcher):
             return f"исчерпан лимит заявок ({cfg['max_orders']})"
         if self.spent >= cfg["max_spend_usd"]:
             return f"исчерпан лимит суммы (${cfg['max_spend_usd']:.2f})"
+        # Предел потерь в ДОЛЯХ счёта. Лимит в $150 при счёте $10.48 не защищал
+        # ни от чего: за 23 минуты ушло 86% счёта, не приблизившись к лимиту.
+        cap = self.loss_cap()
+        if cap is not None and self.spent >= cap:
+            return (f"потеряно ${self.spent:.2f} — это "
+                    f"{cfg['day_loss_frac'] * 100:.0f}% счёта на старте")
         return ""
+
+    def loss_cap(self) -> float | None:
+        """Сколько денег разрешено потерять за запуск (доля счёта на старте)."""
+        b = getattr(self.trader, "start_balance", None)
+        return None if not b else b * self.cfg["day_loss_frac"]
 
     def on_signal(self, sig: dict) -> None:
         if self.cfg.get("use_model"):

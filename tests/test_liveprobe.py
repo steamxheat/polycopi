@@ -760,7 +760,8 @@ class BalanceCapTests(unittest.IsolatedAsyncioTestCase):
             async def post_order(self, signed):
                 return {"status": "unmatched", "makingAmount": "0", "takingAmount": "0"}
 
-        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        cfg = dict(liveprobe.DEFAULTS, risk_frac=1.0)   # проверяем не долю риска
+        t = liveprobe.LiveTrader(cfg)
         t.client = C()
         t.balance = balance
         return t, got
@@ -816,7 +817,8 @@ class ConfirmTests(unittest.IsolatedAsyncioTestCase):
             def get_trades(self):
                 return _done(list(trades))
 
-        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        cfg = dict(liveprobe.DEFAULTS, risk_frac=1.0)   # проверяем сверку со счётом
+        t = liveprobe.LiveTrader(cfg)
         t.client = C()
         t.balance = 10.48
         return t
@@ -902,3 +904,88 @@ class ProvenRangeTests(unittest.TestCase):
     def test_dear_signal_is_skipped_too(self):
         src = (Path(__file__).resolve().parent.parent / "liveprobe.py").read_text()
         self.assertIn('if limit > self.cfg["max_price"]', src)
+
+
+class RiskLimitTests(unittest.IsolatedAsyncioTestCase):
+    """Урок $8.98: минимум заявки $1 при счёте $10.48 — это 10% счёта на
+    сделку, девять сделок = 90% счёта за 23 минуты. Считаем в долях счёта."""
+
+    def _trader(self, balance, **over):
+        got = {}
+
+        class C:
+            async def create_market_order(self, **kw):
+                got.update(kw)
+                return {"ok": True}
+
+            async def post_order(self, signed):
+                return {"status": "unmatched"}
+
+            def get_balance_allowance(self, **k):
+                return _done(type("B", (), {"balance": balance * 1_000_000})())
+
+        cfg = dict(liveprobe.DEFAULTS); cfg.update(over)
+        t = liveprobe.LiveTrader(cfg)
+        t.client = C()
+        t.balance = balance
+        return t, got
+
+    async def test_stake_trimmed_to_the_risk_share(self):
+        t, got = self._trader(150.0)                 # 2% = $3.00
+        await t.buy("TOK", 0.60, 50.0)               # хотели $30
+        self.assertEqual(got["amount"], "3.00")
+
+    async def test_no_trade_when_the_minimum_breaks_the_risk_share(self):
+        """Ровно наш случай: 2% от $10.48 = $0.21, а минимум заявки $1."""
+        t, got = self._trader(10.48)
+        r = await t.buy("TOK", 0.05, 5.0)
+        self.assertEqual(r["status"], "too_big")
+        self.assertEqual(got, {})                    # бирже ничего не послали
+        self.assertIn("не влезает в риск", r["error"])
+        self.assertIn("$50", r["error"])             # подсказка, сколько нужно
+
+    async def test_the_old_behaviour_is_gone(self):
+        """Раньше $0.25 раздувалось до $1 — 10% счёта. Больше нет."""
+        t, got = self._trader(10.48)
+        await t.buy("TOK", 0.05, 5.0)
+        self.assertNotIn("amount", got)
+
+    async def test_small_account_still_trades_within_its_share(self):
+        t, got = self._trader(80.0, risk_frac=0.02)  # 2% = $1.60
+        await t.buy("TOK", 0.60, 5.0)                # хотели $3.00
+        self.assertEqual(got["amount"], "1.60")
+
+
+class LossCapTests(unittest.TestCase):
+    """Лимит в $150 при счёте $10.48 не защищал ни от чего."""
+
+    def _probe(self, start, spent, **over):
+        cfg = dict(liveprobe.DEFAULTS); cfg.update(over)
+        pr = liveprobe.Prober.__new__(liveprobe.Prober)
+        pr.cfg = cfg
+        pr.spent = spent
+        pr.orders = 0
+        pr.halted = ""
+        pr.out = Path("/нет/такого")
+        pr.trader = type("T", (), {"start_balance": start})()
+        return pr
+
+    def test_stops_at_the_share_of_the_account(self):
+        pr = self._probe(10.48, 1.60)                # 15% от 10.48 = $1.57
+        self.assertIn("% счёта", pr.budget_left())
+
+    def test_keeps_going_below_the_share(self):
+        self.assertEqual(self._probe(10.48, 1.00).budget_left(), "")
+
+    def test_cap_scales_with_the_account(self):
+        self.assertAlmostEqual(self._probe(150.0, 0).loss_cap(), 22.5)
+        self.assertAlmostEqual(self._probe(10.48, 0).loss_cap(), 1.572)
+
+    def test_unknown_balance_leaves_the_dollar_limit(self):
+        self.assertIsNone(self._probe(None, 0).loss_cap())
+
+    def test_the_old_dollar_limit_would_not_have_saved_us(self):
+        """$9 потерь при лимите $150 — старый предел молчал, новый кричит."""
+        pr = self._probe(10.48, 8.98)
+        self.assertLess(pr.spent, pr.cfg["max_spend_usd"])
+        self.assertIn("% счёта", pr.budget_left())
