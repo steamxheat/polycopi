@@ -415,9 +415,18 @@ class LiveTrader:
         return v if v and v > 0 else self.cfg["min_order_shares"]
 
     async def read_balance(self) -> float | None:
+        """Баланс ВСЕГДА в микроединицах — это подтверждено самой биржей.
+
+        В тексте её отказов стоял баланс: 1925589 в момент, когда на счёте было
+        $1.93, и 1499829 при $1.50 (data_probe/orders.csv, 29.10 15:00 и 15:15).
+        Значит формат известен, и угадывать единицы по величине числа (to_units)
+        здесь нельзя: баланс $0.50 пришёл бы как 500000 и был бы прочитан как
+        полмиллиона долларов, а на нём считаются все наши лимиты риска.
+        """
         b = await self._in_thread(
             self.client.get_balance_allowance(asset_type="COLLATERAL"))
-        self.balance = to_units(_num(getattr(b, "balance", None)), 1e4)
+        raw = _num(getattr(b, "balance", None))
+        self.balance = None if raw is None else raw / SCALE
         return self.balance
 
     async def cancel_all(self, when: str):

@@ -1150,3 +1150,45 @@ class SafetyStopTests(unittest.TestCase):
         pr.halt("первая причина")
         pr.halt("вторая")
         self.assertEqual(pr.halted, "первая причина")
+
+
+class BalanceUnitsTests(unittest.IsolatedAsyncioTestCase):
+    """Баланс читается по подтверждённому формату, а не угадывается.
+
+    Доказательство формата — в отказах самой биржи (data_probe/orders.csv):
+    "balance: 1925589" когда на счёте было $1.93, "balance: 1499829" при $1.50.
+    """
+
+    def _t(self, raw):
+        class C:
+            def get_balance_allowance(self, **k):
+                return _done(type("B", (), {"balance": raw})())
+
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.client = C()
+        return t
+
+    async def test_values_the_exchange_actually_sent(self):
+        self.assertAlmostEqual(await self._t(1925589).read_balance(), 1.925589)
+        self.assertAlmostEqual(await self._t(1499829).read_balance(), 1.499829)
+
+    async def test_balance_under_a_dollar_is_not_half_a_million(self):
+        """Старое угадывание по величине числа возвращало здесь 500000."""
+        self.assertAlmostEqual(await self._t(500_000).read_balance(), 0.50)
+        self.assertAlmostEqual(await self._t(1_000_000).read_balance(), 1.00)
+        self.assertAlmostEqual(await self._t(1_000).read_balance(), 0.001)
+
+    async def test_large_account_reads_correctly_too(self):
+        self.assertAlmostEqual(await self._t(150_000_000).read_balance(), 150.0)
+
+    async def test_missing_balance_stays_unknown(self):
+        self.assertIsNone(await self._t(None).read_balance())
+
+    async def test_tiny_balance_blocks_trading_instead_of_unlocking_it(self):
+        """Главное последствие: на $0.50 лимиты риска должны запрещать заявку,
+        а не разрешать её от имени полумиллиона долларов."""
+        t = self._t(500_000)
+        await t.read_balance()
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertIn(r["status"], ("no_funds", "too_big"))
+        self.assertEqual(r["spent"], 0.0)
