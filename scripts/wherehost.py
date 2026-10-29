@@ -48,7 +48,8 @@ def get(url: str, timeout: float = 20):
 
 def start(target: str, cities: list[str], poster=post) -> str:
     body = {"type": "http", "target": target,
-            "locations": [{"city": c, "limit": 1} for c in cities],
+            # несколько узлов на город: один может оказаться на плохом канале
+            "locations": [{"city": c, "limit": 3} for c in cities],
             "measurementOptions": {"protocol": "HTTPS",
                                    "request": {"path": "/", "method": "GET"}}}
     return poster(API, body)["id"]
@@ -64,7 +65,14 @@ def wait(mid: str, getter=get, sleep=time.sleep, tries: int = 20) -> dict:
 
 
 def rows(d: dict) -> list[tuple]:
-    out = []
+    """Город -> лучшее время. ВАЖНО: Globalping отдаёт миллисекунды, не секунды.
+
+    По каждому городу берём МИНИМУМ из нескольких узлов: медленный результат
+    почти всегда означает плохой канал у конкретной машины, а нам нужен
+    физический предел пути до биржи.
+    """
+    by_city: dict[str, list] = {}
+    fails: dict[str, str] = {}
     for r in d.get("results", []):
         probe = r.get("probe") or {}
         res = r.get("result") or {}
@@ -72,11 +80,18 @@ def rows(d: dict) -> list[tuple]:
         city = probe.get("city") or probe.get("country") or "?"
         total = t.get("total")
         if total is None:
-            out.append((city, None, None, None, res.get("status") or "нет ответа"))
+            fails.setdefault(city, res.get("status") or "нет ответа")
             continue
-        # «чистое» время без рукопожатий — то, что увидит наш бот на живом соединении
         warm = total - (t.get("dns") or 0) - (t.get("tcp") or 0) - (t.get("tls") or 0)
-        out.append((city, total, warm, t.get("tls"), ""))
+        by_city.setdefault(city, []).append((total, max(warm, 0.0)))
+    out = []
+    for city, xs in by_city.items():
+        total = min(x[0] for x in xs)
+        warm = min(x[1] for x in xs)
+        out.append((city, total, warm, len(xs), ""))
+    for city, err in fails.items():
+        if city not in by_city:
+            out.append((city, None, None, 0, err))
     out.sort(key=lambda x: (x[1] is None, x[1]))
     return out
 
@@ -86,17 +101,15 @@ def report(d: dict) -> str:
     if not rs:
         return "Пусто: замер не вернул результатов."
     L = ["=== Где стоит сервер биржи (замер из городов) ===",
+         "Время в МИЛЛИСЕКУНДАХ, по каждому городу — лучший узел из нескольких.",
          "«всего» — весь запрос с нуля; «на живом» — без рукопожатий, как у нашего бота.",
          "Где меньше — там сервер ближе. Торговать можно только из разрешённых стран.", "",
-         f"{'город':<14}{'всего':>9}{'на живом':>11}{'API-торговля':>16}"]
-    best = None
-    for city, total, warm, _tls, err in rs:
+         f"{'город':<14}{'всего':>9}{'на живом':>11}{'узлов':>7}{'API-торговля':>16}"]
+    for city, total, warm, n, err in rs:
         if total is None:
             L.append(f"{city:<14}{err:>9}")
             continue
-        if best is None:
-            best = (city, warm)
-        L.append(f"{city:<14}{total * 1000:>8.0f}мс{warm * 1000:>10.0f}мс"
+        L.append(f"{city:<14}{total:>8.0f}мс{warm:>10.0f}мс{n:>7}"
                  f"{ALLOWED.get(city, '? проверить'):>16}")
     ok = [(c, w) for c, t, w, _, e in rs if t is not None
           and str(ALLOWED.get(c, "")).startswith("✅")]
@@ -104,10 +117,10 @@ def report(d: dict) -> str:
     if ok:
         bc, bw = ok[0]
         ams = next((w for c, w in ok if c == "Amsterdam"), None)
-        L.append(f"Лучший из РАЗРЕШЁННЫХ: {bc} — {bw * 1000:.0f}мс на живом соединении.")
+        L.append(f"Лучший из РАЗРЕШЁННЫХ: {bc} — {bw:.0f}мс на живом соединении.")
         if ams is not None and bc != "Amsterdam":
-            d_ms = (ams - bw) * 1000
-            L.append(f"Наш Амстердам: {ams * 1000:.0f}мс. Выигрыш от переезда: {d_ms:.0f}мс.")
+            d_ms = ams - bw
+            L.append(f"Наш Амстердам: {ams:.0f}мс. Выигрыш от переезда: {d_ms:.0f}мс.")
             L.append("Меньше 10мс — переезд не стоит возни: по нашей таблице выживания это"
                      if d_ms < 10 else
                      "Больше 10мс — есть смысл проверить на дешёвой машине там же.")
