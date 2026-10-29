@@ -197,6 +197,10 @@ class ModelGateTests(unittest.IsolatedAsyncioTestCase):
         r = fillcheck.rows(self.tmp / "orders.csv")[0]
         self.assertAlmostEqual(float(r["edge"]), 0.05)
 
+    def test_measurement_off_in_live_mode(self):
+        """Иначе лишняя работа в цикле задерживает отправку заявки."""
+        self.assertFalse(liveprobe.DEFAULTS["measure"])
+
     def test_model_borrowed_from_working_bot(self):
         """Расчёт должен быть ТОТ ЖЕ, что у fvsim, а не копией."""
         import fvsim

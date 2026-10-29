@@ -55,6 +55,7 @@ DEFAULTS = {
     "signal_gap_s": 5.0,        # не брать один и тот же токен чаще, чем раз в N с
     "fill_tolerance": 0.01,     # бот готов взять до «увиденная цена + 1¢» — как в fvsim
     "rest_every_s": 2.0,        # как часто сверять REST с живой лентой
+    "measure": True,            # вести замеры рынка (время жизни заявок, выживание, призраки)
     "loop_s": 0.02,
     "trigger_gap_s": 0.01,      # не чаще раза в 10 мс (цены приходят пачками)
     "status_every_s": 60,
@@ -199,6 +200,8 @@ class Watcher:
 
     # ------------------------------------------------- 1) время жизни лучшего аска
     def on_ask_change(self, tok, prev, new, now):
+        if not self.cfg.get("measure", True):
+            return                       # в живом режиме это лишняя работа в цикле
         mk = self.tok_mkt.get(tok)
         old = self.open_level.pop(tok, None)
         if old and prev is not None:
@@ -246,7 +249,8 @@ class Watcher:
                 self.last_signal[tok] = now
                 sig = {"tok": tok, "ask0": a, "t0": now, "mv": mv, "age": age,
                        "mk": mk, "side": side, "ok": {}, "okt": {}}
-                self.pending.append(sig)
+                if self.cfg.get("measure", True):
+                    self.pending.append(sig)
                 self.count("signals")
                 self.on_signal(sig)
 
@@ -278,6 +282,8 @@ class Watcher:
 
     # ------------------------------------------------------ 3) призраки в REST
     async def check_rest(self):
+        if not self.cfg.get("measure", True):
+            return
         toks = [t for m in self.markets.values() if not m.resolved for t in (m.up, m.down)
                 if t in self.book.ask]
         if not toks:

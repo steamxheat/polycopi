@@ -163,6 +163,48 @@ class MemoryTests(unittest.TestCase):
         self.assertNotIn("U", w.tok_mkt)
 
 
+class MeasureOffTests(unittest.TestCase):
+    """В живом режиме замеры рынка выключены: лишняя работа в цикле задерживает
+    отправку заявок (750 мс против 208 мс «чистой» отправки)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_level_tracking(self):
+        w, api, _ = mkw(self.tmp, measure=False)
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        api.t += 0.2
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.62", "size": "10"}]}, api.t)
+        self.assertEqual(len(w.lives), 0)
+        self.assertEqual(w.n_lives, 0)
+
+    def test_no_survival_checks_but_signal_still_fires(self):
+        w, api, mk = mkw(self.tmp, measure=False, lead_sources=None, move_bps=3.0)
+        fired = []
+        w.on_signal = fired.append
+        api.t = mk.start + 60
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t - 2)
+        feed(w, api, 6.0)
+        w.check_signals()
+        self.assertEqual(len(fired), 1)        # сигнал есть
+        self.assertEqual(len(w.pending), 0)    # а проверок выживания нет
+
+    def test_measure_on_by_default(self):
+        w, api, _ = mkw(self.tmp)
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.60", "size": "10"}]}, api.t)
+        api.t += 0.2
+        w.book.on_event({"event_type": "book", "asset_id": "U",
+                         "asks": [{"price": "0.62", "size": "10"}]}, api.t)
+        self.assertEqual(w.n_lives, 1)
+
+
 class SurvivalTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
