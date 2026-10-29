@@ -185,6 +185,7 @@ class LiveTrader:
         self.client = None
         # Свой цикл в отдельном потоке: иначе разбор потока стаканов задерживает
         # отправку (подпись прыгала с 8 до 151 мс — задача просто ждала очереди).
+        self.balance: float | None = None     # долларов на счёте, None = не прочитан
         self.loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
 
@@ -284,11 +285,22 @@ class LiveTrader:
             log.info(f"Состояние разрешений не прочиталось ({type(e).__name__}); "
                      f"если заявки будут отвергаться — запусти: liveprobe.py approvals")
         try:
-            b = await self._in_thread(self.client.get_balance_allowance(asset_type="COLLATERAL"))
-            log.info(f"Баланс: {usd(getattr(b, 'balance', None))}")
+            await self.read_balance()
+            log.info(f"Баланс: {usd(self.balance)}")
+            need = self.cfg["shares"] * self.cfg["max_price"]
+            if self.balance is not None and self.balance < need:
+                log.info(f"ВНИМАНИЕ: на {self.cfg['shares']:g} билетов по верхней цене нужно "
+                         f"${need:.2f}, а на счёте {usd(self.balance)}. Размер заявки будем "
+                         f"урезать под баланс; дорогие билеты купить не выйдет.")
         except Exception as e:  # noqa: BLE001
             log.info(f"Баланс не прочитался: {type(e).__name__}")
         await self.cancel_all("на старте")
+
+    async def read_balance(self) -> float | None:
+        b = await self._in_thread(
+            self.client.get_balance_allowance(asset_type="COLLATERAL"))
+        self.balance = to_units(_num(getattr(b, "balance", None)), 1e4)
+        return self.balance
 
     async def cancel_all(self, when: str):
         try:
@@ -332,7 +344,23 @@ class LiveTrader:
         # Для покупки биржа требует СУММУ в долларах, а не количество билетов
         # ("amount is required for BUY market orders"). Потолок цены задаём отдельно.
         amount = max(round(shares * limit, 2), self.cfg["min_order_usd"])
-        return await self._in_thread(self._buy_here(tok, limit, shares, amount))
+        # Больше, чем есть на счёте, бирже посылать незачем: заявку отвергнут,
+        # а мы решим, что не успели по скорости. Оставляем 5% на сборы.
+        if self.balance is not None:
+            room = round(self.balance * 0.95, 2)
+            if room < self.cfg["min_order_usd"]:
+                return {"ok": False, "status": "no_funds", "filled": 0.0, "avg_price": None,
+                        "spent": 0.0, "sign_ms": 0.0, "post_ms": 0.0, "note": "",
+                        "error": f"не хватает денег: на счёте {usd(self.balance)}, "
+                                 f"минимум заявки ${self.cfg['min_order_usd']:.2f}"}
+            if amount > room:
+                amount = room
+                shares = round(amount / limit, 4)
+        r = await self._in_thread(self._buy_here(tok, limit, shares, amount))
+        r["shares_sent"] = shares
+        if r.get("spent"):                       # купили — денег стало меньше
+            self.balance = max((self.balance or 0.0) - r["spent"], 0.0)
+        return r
 
     async def close(self):
         if self.client is None:

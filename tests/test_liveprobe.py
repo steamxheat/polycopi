@@ -739,3 +739,59 @@ class PriceSlackTests(unittest.TestCase):
 
     def test_never_below_the_floor(self):
         self.assertAlmostEqual(self._p().price_slack(0.0), 0.01)
+
+
+class BalanceCapTests(unittest.IsolatedAsyncioTestCase):
+    """Заявка не должна быть больше денег на счёте: иначе отказ выглядит как
+    «не успели по скорости», хотя дело в балансе."""
+
+    def _trader(self, balance):
+        got = {}
+
+        class C:
+            async def create_market_order(self, **kw):
+                got.update(kw)
+                return {"ok": True}
+
+            async def post_order(self, signed):
+                return {"status": "unmatched", "makingAmount": "0", "takingAmount": "0"}
+
+        t = liveprobe.LiveTrader(dict(liveprobe.DEFAULTS))
+        t.client = C()
+        t.balance = balance
+        return t, got
+
+    async def test_order_trimmed_to_balance(self):
+        t, got = self._trader(1.93)                  # на счёте $1.93
+        r = await t.buy("TOK", 0.93, 5.0)            # хотели $4.65
+        self.assertEqual(got["amount"], "1.83")      # 1.93 * 0.95
+        self.assertAlmostEqual(r["shares_sent"], 1.9677, places=3)
+
+    async def test_full_size_when_money_is_there(self):
+        t, got = self._trader(50.0)
+        await t.buy("TOK", 0.60, 5.0)
+        self.assertEqual(got["amount"], "3.00")
+
+    async def test_no_order_at_all_below_minimum(self):
+        t, got = self._trader(0.40)                  # даже на $1 не хватает
+        r = await t.buy("TOK", 0.60, 5.0)
+        self.assertEqual(r["status"], "no_funds")
+        self.assertEqual(got, {})                    # бирже ничего не послали
+        self.assertIn("не хватает денег", r["error"])
+
+    async def test_unknown_balance_does_not_block(self):
+        t, got = self._trader(None)
+        await t.buy("TOK", 0.60, 5.0)
+        self.assertEqual(got["amount"], "3.00")
+
+    async def test_balance_drops_after_a_fill(self):
+        t, _ = self._trader(10.0)
+        t._buy_here = lambda *a, **k: _done({"ok": True, "status": "filled", "filled": 5.0,
+                                             "avg_price": 0.6, "spent": 3.0, "sign_ms": 1.0,
+                                             "post_ms": 1.0, "error": "", "note": ""})
+        await t.buy("TOK", 0.60, 5.0)
+        self.assertAlmostEqual(t.balance, 7.0)
+
+
+async def _done(v):
+    return v
