@@ -84,6 +84,25 @@ class ReportTests(unittest.TestCase):
         self.assertIn("Худшая серия подряд без выигрыша: 3 сделок", txt)
         self.assertIn("Самый большой убыток за одну сделку: -9.90$", txt)
 
+    def test_price_buckets_show_where_profit_comes_from(self):
+        """Дешёвые в плюсе, дорогие в минусе — таблица обязана это показать."""
+        ts = [trade(9.0, cost=1.0, shares=10, vwap=0.10) for _ in range(3)]      # дешёвые
+        ts += [trade(-1.0, cost=1.0, shares=10, vwap=0.10, won=False) for _ in range(7)]
+        ts += [trade(-4.0, cost=4.0, shares=5, vwap=0.90, won=False) for _ in range(5)]  # дорогие
+        write(self.d, ts)
+        txt = extremes.report(self.d, "A", top=2)
+        cheap = next(l for l in txt.splitlines() if "дешёвые" in l)
+        fav = next(l for l in txt.splitlines() if "фавориты" in l)
+        self.assertIn("+20.00", cheap)        # 3*9 - 7*1
+        self.assertIn("-20.00", fav)
+        self.assertIn("30%", cheap)           # винрейт 3 из 10
+
+    def test_buckets_skip_empty_ranges(self):
+        write(self.d, [trade(1.0, vwap=0.55)])
+        txt = extremes.report(self.d, "A", top=1)
+        self.assertIn("50-70¢", txt)
+        self.assertNotIn("15-30¢", txt)
+
     def test_no_data(self):
         (self.d / "state.json").write_text(json.dumps({"variants": {}}))
         self.assertIn("Нет рассчитанных сделок", extremes.report(self.d, "A", 5))

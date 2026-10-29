@@ -50,6 +50,30 @@ def line(t: dict) -> str:
             f"за {t['tau']:.0f}с до конца")
 
 
+BUCKETS = [(0.00, 0.15, "дешёвые 5-15¢"), (0.15, 0.30, "15-30¢"), (0.30, 0.50, "30-50¢"),
+           (0.50, 0.70, "50-70¢"), (0.70, 0.85, "70-85¢"), (0.85, 1.01, "фавориты 85-95¢")]
+
+
+def by_price(ts: list[dict]) -> list[str]:
+    """Откуда на самом деле берётся прибыль. Крупные выигрыши всегда выпадают на
+    дешёвые билеты просто потому, что они платят в 20 раз больше вложенного —
+    поэтому смотреть надо не на крайности, а на итог каждой ценовой группы."""
+    tot = sum(t["pnl"] for t in ts)
+    L = ["  --- откуда берётся прибыль (по цене покупки) ---",
+         f"  {'цена':<18}{'сделок':>7}{'выигр':>7}{'итог $':>9}{'ROI':>8}{'доля прибыли':>14}"]
+    for lo, hi, name in BUCKETS:
+        g = [t for t in ts if lo <= t["vwap"] < hi]
+        if not g:
+            continue
+        pnl = sum(t["pnl"] for t in g)
+        cost = sum(t["cost"] for t in g)
+        wr = sum(1 for t in g if t["won"]) / len(g)
+        share = pnl / tot * 100 if tot else 0
+        L.append(f"  {name:<18}{len(g):>7}{wr:>6.0%}{pnl:>+9.2f}"
+                 f"{pnl / cost * 100 if cost else 0:>+7.0f}%{share:>13.0f}%")
+    return L
+
+
 def report(d: Path, variant: str | None, top: int) -> str:
     data = load(d, variant)
     if not data:
@@ -67,6 +91,7 @@ def report(d: Path, variant: str | None, top: int) -> str:
               f"(медиана {statistics.median(costs):.2f}$)",
               f"  цена:    от {min(prices):.2f} до {max(prices):.2f}  "
               f"(медиана {statistics.median(prices):.2f})", ""]
+        L += by_price(ts) + [""]
         best = sorted(ts, key=lambda t: -t["pnl"])[:top]
         worst = sorted(ts, key=lambda t: t["pnl"])[:top]
         L += [f"  --- {len(best)} самых крупных выигрышей ---"] + [line(t) for t in best]
