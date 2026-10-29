@@ -190,14 +190,14 @@ class CheckTests(unittest.TestCase):
             del os.environ["POLYMARKET_PRIVATE_KEY"]
 
 
-class CheckSignatureTests(unittest.TestCase):
-    """check должен ловить не только пропавшие методы, но и не те аргументы:
-    без order_type заявка осталась бы висеть на рынке как GTC."""
+class CheckIntrospectionTests(unittest.TestCase):
+    """check должен ПОКАЗЫВАТЬ настоящие подписи, а не верить документации:
+    в версии 0.14.0 у place_limit_order нет order_type, и заявка повисла бы как GTC."""
 
     def setUp(self):
         import types
         self.mod = types.ModuleType("polymarket")
-        self.mod.__version__ = "9.9.9"
+        self.mod.__version__ = "0.14.0"
         self.saved = sys.modules.get("polymarket")
 
     def tearDown(self):
@@ -211,37 +211,73 @@ class CheckSignatureTests(unittest.TestCase):
         sys.modules["polymarket"] = self.mod
         return liveprobe.check()
 
-    def test_full_signature_passes(self):
-        class Good:
-            def place_limit_order(self, asset_id, side, price, size, order_type="GTC"): ...
+    def test_lists_order_methods_with_signatures(self):
+        class C:
+            def place_limit_order(self, *, asset_id=None, price=0, size=0, side="BUY",
+                                  post_only=False, expiration=None): ...
+            def place_market_order(self, *, asset_id=None, amount=0, side="BUY",
+                                   order_type="FAK"): ...
             def post_order(self, o): ...
             def setup_trading_approvals(self): ...
-        txt = self.install(Good)
-        self.assertIn("можно dry, потом live", txt)
-        self.assertNotIn("НЕ ЗАПУСКАТЬ", txt)
+        txt = self.install(C)
+        self.assertIn("place_limit_order(self, *, asset_id=None", txt)
+        self.assertIn("place_market_order", txt)
+        # признаки «не оставлять висеть» должны быть найдены там, где они есть
+        hint = txt[txt.index("можно ли НЕ оставлять"):]
+        self.assertIn("order_type", hint)
+        self.assertIn("post_only", hint)
 
-    def test_missing_order_type_blocks_live(self):
-        class Bad:
-            def place_limit_order(self, asset_id, side, price, size): ...
+    def test_missing_base_method_blocks_live(self):
+        class C:
+            def place_limit_order(self, **k): ...
+        txt = self.install(C)
+        self.assertIn("ЖИВОЙ РЕЖИМ НЕ ЗАПУСКАТЬ", txt)
+        self.assertIn("post_order", txt)
+
+    def test_no_take_and_leave_option_is_reported(self):
+        class C:
+            def place_order(self, asset_id, size, side): ...
             def post_order(self, o): ...
             def setup_trading_approvals(self): ...
-        txt = self.install(Bad)
-        self.assertIn("НЕ ЗАПУСКАТЬ", txt)
-        self.assertIn("нет order_type", txt)
+        txt = self.install(C)
+        self.assertIn("подходящих признаков не найдено", txt)
 
-    def test_missing_method_blocks_live(self):
-        class Bad:
-            def post_order(self, o): ...
-        txt = self.install(Bad)
-        self.assertIn("НЕ ЗАПУСКАТЬ", txt)
-        self.assertIn("отсутствуют методы", txt)
+    def test_wrong_library_detected(self):
+        class Nothing:
+            pass
+        self.mod.AsyncSecureClient = None
+        sys.modules["polymarket"] = self.mod
+        self.assertIn("НЕТ класса AsyncSecureClient", liveprobe.check())
 
-    def test_kwargs_signature_accepted(self):
-        class Flexible:
-            def place_limit_order(self, **kwargs): ...
-            def post_order(self, o): ...
-            def setup_trading_approvals(self): ...
-        self.assertNotIn("НЕ ЗАПУСКАТЬ", self.install(Flexible))
+    def test_response_fields_printed_from_pydantic_like_model(self):
+        import types
+        resp = types.ModuleType("polymarket.models.clob.order_response")
+
+        class AcceptedOrder:
+            model_fields = {"order_id": 1, "status": 2, "size_matched": 3}
+
+        class RejectedOrder:
+            model_fields = {"message": 1, "error_code": 2}
+        resp.AcceptedOrder, resp.RejectedOrder = AcceptedOrder, RejectedOrder
+        clob = types.ModuleType("polymarket.models.clob")
+        clob.order_response = resp
+        models = types.ModuleType("polymarket.models")
+        models.clob = clob
+        for name, m in (("polymarket.models", models), ("polymarket.models.clob", clob),
+                        ("polymarket.models.clob.order_response", resp)):
+            sys.modules[name] = m
+        try:
+            class C:
+                def place_limit_order(self, **k): ...
+                def post_order(self, o): ...
+                def setup_trading_approvals(self): ...
+            txt = self.install(C)
+            self.assertIn("AcceptedOrder: order_id, size_matched, status", txt)
+            self.assertIn("RejectedOrder: error_code, message", txt)
+        finally:
+            for name in ("polymarket.models", "polymarket.models.clob",
+                         "polymarket.models.clob.order_response"):
+                sys.modules.pop(name, None)
 
 
 class ReportTests(unittest.TestCase):

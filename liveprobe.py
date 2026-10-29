@@ -298,16 +298,34 @@ async def approvals(cfg: dict, out: Path):
 
 # ======================================================================= check
 
-EXPECTED = ["place_limit_order", "post_order", "setup_trading_approvals"]
-# аргументы, без которых живой режим опасен: без order_type заявка может остаться
-# висеть на рынке (GTC) вместо «взять что есть и отменить остаток»
-NEED_ARGS = {"place_limit_order": ("asset_id", "side", "price", "size", "order_type")}
+EXPECTED = ["post_order", "setup_trading_approvals"]
+# «взять что есть и уйти» — без этого заявка повиснет на рынке как GTC
+TAKE_HINTS = ("order_type", "fok", "fak", "immediate", "post_only", "expiration",
+              "slippage", "max_price", "price")
+
+
+def _sig(obj, name):
+    import inspect                                          # noqa: PLC0415
+    try:
+        return f"{name}{inspect.signature(getattr(obj, name))}"
+    except (TypeError, ValueError, AttributeError):
+        return f"{name}(подпись не читается)"
+
+
+def _fields(cls) -> str:
+    mf = getattr(cls, "model_fields", None)                 # pydantic
+    if isinstance(mf, dict) and mf:
+        return ", ".join(sorted(mf))
+    ann = getattr(cls, "__annotations__", {})
+    if ann:
+        return ", ".join(sorted(ann))
+    return ", ".join(n for n in dir(cls) if not n.startswith("_"))[:300]
 
 
 def check() -> str:
-    L = ["=== Проверка библиотеки polymarket-client ==="]
+    L = ["=== Разбор установленной библиотеки polymarket-client ==="]
     try:
-        import polymarket                                    # noqa: PLC0415
+        import polymarket                                   # noqa: PLC0415
     except ImportError as e:
         return "\n".join(L + [f"НЕ УСТАНОВЛЕНА: {e}", "",
                               "Поставить:  pip install --break-system-packages polymarket-client",
@@ -316,43 +334,46 @@ def check() -> str:
     cl = getattr(polymarket, "AsyncSecureClient", None)
     if cl is None:
         return "\n".join(L + ["НЕТ класса AsyncSecureClient — библиотека не та, что ожидается."])
-    import inspect                                        # noqa: PLC0415
-    have = {m: hasattr(cl, m) for m in EXPECTED}
-    missing = [m for m, ok in have.items() if not ok]
-    bad_args: list[str] = []
-    for m, ok in have.items():
-        if not ok:
-            L.append(f"  ❌ {m} — метода нет")
-            continue
+
+    names = [n for n in dir(cl) if not n.startswith("_")]
+    orders = sorted(n for n in names if "order" in n.lower())
+    L += ["", "--- всё, что про заявки ---"] + [f"  {_sig(cl, n)}" for n in orders]
+    other = sorted(n for n in names if n not in orders and
+                   any(k in n.lower() for k in ("cancel", "approv", "balance", "book", "trade")))
+    if other:
+        L += ["", "--- рядом (отмена, разрешения, стакан) ---"] + \
+             [f"  {_sig(cl, n)}" for n in other]
+
+    L += ["", "--- поля ответов ---"]
+    for mod_name in ("models.clob.order_response", "models"):
         try:
-            sig = inspect.signature(getattr(cl, m))
-            names = set(sig.parameters)
-        except (TypeError, ValueError):
-            L.append(f"  ⚠️ {m} — подпись не читается, проверить вручную")
+            mod = __import__(f"polymarket.{mod_name}", fromlist=["*"])
+        except ImportError:
             continue
-        need = NEED_ARGS.get(m, ())
-        lost = [a for a in need if a not in names and "kwargs" not in str(sig)]
-        if lost:
-            bad_args.append(f"{m}: нет {', '.join(lost)}")
-            L.append(f"  ❌ {m}{sig}")
-        else:
-            L.append(f"  ✅ {m}" + (f" (есть {', '.join(need)})" if need else ""))
+        for cname in ("AcceptedOrder", "RejectedOrder", "OrderResponse"):
+            c = getattr(mod, cname, None)
+            if c is not None:
+                L.append(f"  {cname}: {_fields(c)}")
+        break
+
+    L += ["", "--- можно ли НЕ оставлять заявку висеть ---"]
+    hints = []
+    for n in orders:
+        sig = _sig(cl, n).lower()
+        found = [h for h in TAKE_HINTS if h in sig]
+        if found:
+            hints.append(f"  {n}: {', '.join(found)}")
+    L += hints or ["  подходящих признаков не найдено"]
+
+    missing = [m for m in EXPECTED if not hasattr(cl, m)]
     L.append("")
-    if missing or bad_args:
-        L.append("ЖИВОЙ РЕЖИМ НЕ ЗАПУСКАТЬ:")
-        if missing:
-            L.append(f"  отсутствуют методы: {', '.join(missing)}")
-        for b in bad_args:
-            L.append(f"  не те аргументы — {b}")
-        L.append("  надо сверить вызовы с документацией установленной версии.")
-    else:
-        L.append("Все нужные методы и аргументы на месте — можно dry, потом live.")
+    L.append(f"ЖИВОЙ РЕЖИМ НЕ ЗАПУСКАТЬ: отсутствуют {', '.join(missing)}" if missing else
+             "Базовые методы на месте. Вызовы в коде надо сверить с подписями выше.")
     cr = LiveTrader.credentials()
-    L.append("")
-    L.append("ключ найден: " + ("да" if cr.get("POLYMARKET_PRIVATE_KEY") else
-                                "НЕТ (~/.polymarket.env или переменная окружения)"))
-    L.append("адрес кошелька: " + ("указан" if cr.get("POLYMARKET_WALLET_ADDRESS") else
-                                   "не указан (нужен для обычного кошелька)"))
+    L += ["", "ключ найден: " + ("да" if cr.get("POLYMARKET_PRIVATE_KEY") else
+                                 "НЕТ (~/.polymarket.env или переменная окружения)"),
+          "адрес кошелька: " + ("указан" if cr.get("POLYMARKET_WALLET_ADDRESS") else
+                                "не указан (нужен для обычного кошелька)")]
     return "\n".join(L)
 
 
