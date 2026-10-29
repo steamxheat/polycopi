@@ -22,7 +22,8 @@ class RecordTrader:
     def __init__(self, reply=None, fail=False):
         self.sent = []
         self.reply = reply or {"ok": True, "status": "matched", "filled": 5.0,
-                               "avg_price": 0.61, "error": ""}
+                               "avg_price": 0.61, "spent": 5.0 * 0.61, "error": "",
+                               "note": ""}
         self.fail = fail
 
     async def start(self):
@@ -94,7 +95,7 @@ class SendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unfilled_order_spends_nothing(self):
         t = RecordTrader({"ok": True, "status": "unmatched", "filled": 0.0,
-                          "avg_price": None, "error": ""})
+                          "avg_price": None, "spent": 0.0, "error": "", "note": ""})
         pr, _, _ = mkp(self.tmp, t, lead_sources=None)
         await asyncio.sleep(0.01)
         self.assertEqual(pr.spent, 0.0)
@@ -110,7 +111,7 @@ class LimitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_order_count_cap(self):
         t = RecordTrader({"ok": True, "status": "x", "filled": 0.0, "avg_price": None,
-                          "error": ""})
+                          "spent": 0.0, "error": "", "note": ""})
         pr, api, _ = mkp(self.tmp, t, lead_sources=None, max_orders=2, signal_gap_s=0.0)
         for _ in range(5):
             api.t += 0.05
@@ -188,6 +189,81 @@ class CheckTests(unittest.TestCase):
             self.assertNotIn("ОЧЕНЬ-СЕКРЕТНЫЙ-КЛЮЧ", liveprobe.check())
         finally:
             del os.environ["POLYMARKET_PRIVATE_KEY"]
+
+
+class ParseReplyTests(unittest.TestCase):
+    """Разбор ответа биржи. Самое скользкое — единицы измерения сумм:
+    если библиотека отдаёт их не в долларах, учёт трат поедет."""
+
+    class Accepted:
+        ok = True
+        order_id = "abc"
+        status = "matched"
+        taking_amount = "5"          # полученные билеты
+        making_amount = "3.05"       # потраченные деньги
+
+    class Rejected:
+        ok = False
+        code = "NOT_ENOUGH"
+        message = "insufficient balance"
+
+    def test_accepted_order(self):
+        r = liveprobe.parse_reply(self.Accepted(), limit=0.61, shares=5)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["filled"], 5.0)
+        self.assertAlmostEqual(r["avg_price"], 0.61, places=3)
+        self.assertAlmostEqual(r["spent"], 3.05, places=3)
+        self.assertEqual(r["order_id"], "abc")
+        self.assertEqual(r["note"], "")
+
+    def test_rejected_order(self):
+        r = liveprobe.parse_reply(self.Rejected(), limit=0.61, shares=5)
+        self.assertFalse(r["ok"])
+        self.assertIn("insufficient", r["error"])
+        self.assertEqual(r["filled"], 0.0)
+        self.assertEqual(r["spent"], 0.0)
+
+    def test_unplausible_units_are_flagged_not_trusted(self):
+        """making_amount в микродолларах дал бы цену 609 — такую нельзя принимать."""
+        class Weird:
+            ok = True
+            order_id = "x"
+            status = "matched"
+            taking_amount = "5"
+            making_amount = "3050000"
+        r = liveprobe.parse_reply(Weird(), limit=0.61, shares=5)
+        self.assertIsNone(r["avg_price"])
+        self.assertIn("единицы ответа непонятны", r["note"])
+        self.assertAlmostEqual(r["spent"], 5 * 0.61, places=3)   # считаем по пределу
+
+    def test_more_filled_than_asked_is_flagged(self):
+        class Weird:
+            ok = True
+            order_id = "x"
+            status = "matched"
+            taking_amount = "5000000"
+            making_amount = "3.05"
+        r = liveprobe.parse_reply(Weird(), limit=0.61, shares=5)
+        self.assertIn("больше заказанных", r["note"])
+
+    def test_partial_fill(self):
+        class Part:
+            ok = True
+            order_id = "x"
+            status = "matched"
+            taking_amount = "2"
+            making_amount = "1.18"
+        r = liveprobe.parse_reply(Part(), limit=0.61, shares=5)
+        self.assertEqual(r["filled"], 2.0)
+        self.assertAlmostEqual(r["avg_price"], 0.59, places=2)
+
+    def test_missing_fields(self):
+        class Empty:
+            ok = True
+        r = liveprobe.parse_reply(Empty(), limit=0.61, shares=5)
+        self.assertEqual(r["filled"], 0.0)
+        self.assertEqual(r["spent"], 0.0)
+        self.assertIsNone(r["avg_price"])
 
 
 class CheckIntrospectionTests(unittest.TestCase):

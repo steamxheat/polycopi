@@ -65,6 +65,7 @@ DEFAULTS.update({
     "max_price": 0.95,          # дороже не покупаем никогда
     "limit_extra": 0.01,        # предел цены = увиденный аск + столько (допуск бота)
     "order_type": "FAK",        # взять что можно и отменить остаток; НЕ оставлять заявку
+    # (у place_limit_order в 0.14 нет order_type — она была бы GTC и повисла бы)
     "signal_gap_s": 20.0,       # на калибровке спешить некуда, экономим заявки
     "stop_file": "STOP",        # появился файл с таким именем — больше не отправляем
 })
@@ -82,18 +83,54 @@ class DryTrader:
 
     async def buy(self, tok: str, limit: float, shares: float) -> dict:
         await asyncio.sleep(0)
-        return {"ok": True, "status": "dry", "filled": 0.0, "avg_price": None, "error": ""}
+        return {"ok": True, "status": "dry", "filled": 0.0, "avg_price": None,
+                "spent": 0.0, "error": "", "note": ""}
 
     async def close(self):
         pass
 
 
-class LiveTrader:
-    """Настоящие заявки через официальную библиотеку polymarket-client.
+def _num(x):
+    """Decimal/строка/None -> float или None."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
 
-    Интерфейс библиотеки вызывается через один метод, чтобы при его изменении
-    правка была в одном месте. Перед первым запуском обязательна команда
-    `check`: она сверяет, что у установленной версии есть нужные методы.
+
+def parse_reply(r, limit: float, shares: float) -> dict:
+    """Разбирает AcceptedOrder | RejectedOrder.
+
+    У BUY-заявки taking_amount — полученные билеты, making_amount — потраченные
+    деньги. Единицы измерения библиотека может отдавать по-разному, поэтому
+    средняя цена считается и проверяется на правдоподобие: если она вне (0, 1],
+    считаем её неизвестной и честно говорим об этом, а трату берём по пределу.
+    """
+    ok = bool(getattr(r, "ok", False))
+    filled = _num(getattr(r, "taking_amount", None)) or 0.0
+    paid = _num(getattr(r, "making_amount", None))
+    avg = paid / filled if (paid and filled > 0) else None
+    note = ""
+    if avg is not None and not (0.0 < avg <= 1.0):
+        note = (f"единицы ответа непонятны: taking={filled:g} making={paid:g} "
+                f"-> цена {avg:.4g}, считаю по пределу")
+        avg, paid = None, None
+    if filled > shares + 1e-9:                     # тоже признак других единиц
+        note = note or f"исполнено {filled:g} больше заказанных {shares:g} — проверить единицы"
+    spent = paid if paid is not None else filled * limit
+    return {"ok": ok, "status": str(getattr(r, "status", "") or getattr(r, "code", "")),
+            "filled": filled, "avg_price": avg, "spent": spent,
+            "order_id": str(getattr(r, "order_id", "") or ""),
+            "error": "" if ok else str(getattr(r, "message", ""))[:200],
+            "note": note, "raw_taking": filled, "raw_making": _num(getattr(r, "making_amount", None))}
+
+
+class LiveTrader:
+    """Настоящие заявки через polymarket-client 0.14 (AsyncSecureClient).
+
+    Заявка — РЫНОЧНАЯ с ограничением цены и типом FAK: берём что есть не дороже
+    max_price, остаток отменяется. Висящей заявки не остаётся (у лимитной
+    заявки в этой версии нет order_type, она была бы GTC — так нельзя).
     """
 
     mode = "live"
@@ -101,12 +138,10 @@ class LiveTrader:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.client = None
-        self._ctx = None
 
     @staticmethod
     def credentials() -> dict:
-        """Ключи читаются из окружения или из ~/.polymarket.env. Значения
-        НИКОГДА не логируются и не печатаются."""
+        """Ключи из окружения или ~/.polymarket.env. Значения НИКОГДА не логируются."""
         env = {}
         p = Path.home() / ".polymarket.env"
         if p.exists():
@@ -121,7 +156,7 @@ class LiveTrader:
         return env
 
     async def start(self):
-        from polymarket import AsyncSecureClient            # noqa: PLC0415
+        from polymarket import AsyncSecureClient                 # noqa: PLC0415
 
         cr = self.credentials()
         if not cr.get("POLYMARKET_PRIVATE_KEY"):
@@ -130,36 +165,61 @@ class LiveTrader:
         kw = {"private_key": cr["POLYMARKET_PRIVATE_KEY"]}
         if cr.get("POLYMARKET_WALLET_ADDRESS"):
             kw["wallet"] = cr["POLYMARKET_WALLET_ADDRESS"]
-        self._ctx = await AsyncSecureClient.create(**kw)
-        self.client = self._ctx
-        log.info(f"Кошелёк подключён: тип {getattr(self.client, 'wallet_type', '?')}")
+        self.client = await AsyncSecureClient.create(**kw)
+        log.info(f"Кошелёк подключён, тип {getattr(self.client, 'wallet_type', '?')}")
+        await self.preflight()
+
+    async def preflight(self):
+        """До первой заявки: разрешения, баланс, и снять чужие висящие заявки."""
+        try:
+            st = await self.client.get_trading_approvals_state()
+            log.info(f"Разрешения на торговлю: {st}")
+        except Exception as e:  # noqa: BLE001
+            log.info(f"Состояние разрешений не прочиталось ({type(e).__name__}); "
+                     f"если заявки будут отвергаться — запусти: liveprobe.py approvals")
+        try:
+            b = await self.client.get_balance_allowance(asset_type="COLLATERAL")
+            log.info(f"Баланс/разрешение: {b}")
+        except Exception as e:  # noqa: BLE001
+            log.info(f"Баланс не прочитался: {type(e).__name__}")
+        await self.cancel_all("на старте")
+
+    async def cancel_all(self, when: str):
+        try:
+            r = await self.client.cancel_all()
+            log.info(f"Отмена всех заявок {when}: {r}")
+        except Exception as e:  # noqa: BLE001
+            log.info(f"Отмена всех заявок {when} не удалась: {type(e).__name__}: {e}")
 
     async def approvals(self):
-        await self.client.setup_trading_approvals()
-        log.info("Разрешения на торговлю проверены и выставлены")
+        h = await self.client.setup_trading_approvals()
+        if hasattr(h, "wait"):
+            await h.wait()
+        log.info("Разрешения на торговлю выставлены")
 
     async def buy(self, tok: str, limit: float, shares: float) -> dict:
-        """Лимитная заявка на покупку с типом FAK: берём что есть по цене не
-        хуже limit, остаток отменяется — висящих заявок не остаётся."""
         try:
-            r = await self.client.place_limit_order(
-                asset_id=tok, side="BUY", price=f"{limit:.2f}", size=f"{shares:g}",
+            r = await self.client.place_market_order(
+                asset_id=tok, side="BUY", shares=f"{shares:g}", max_price=f"{limit:.2f}",
                 order_type=self.cfg["order_type"])
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "status": "error", "filled": 0.0, "avg_price": None,
-                    "error": f"{type(e).__name__}: {e}"[:200]}
-        ok = bool(getattr(r, "ok", False))
-        return {"ok": ok, "status": str(getattr(r, "status", "")),
-                "filled": float(getattr(r, "size_matched", 0) or 0),
-                "avg_price": getattr(r, "price", None),
-                "error": "" if ok else str(getattr(r, "message", ""))[:200]}
+                    "spent": 0.0, "error": f"{type(e).__name__}: {e}"[:200], "note": ""}
+        return parse_reply(r, limit, shares)
 
     async def close(self):
-        if self._ctx is not None and hasattr(self._ctx, "__aexit__"):
+        if self.client is None:
+            return
+        await self.cancel_all("на выходе")
+        for m in ("aclose", "close", "__aexit__"):
+            f = getattr(self.client, m, None)
+            if f is None:
+                continue
             try:
-                await self._ctx.__aexit__(None, None, None)
+                await (f(None, None, None) if m == "__aexit__" else f())
+                break
             except Exception:  # noqa: BLE001
-                pass
+                continue
 
 
 # ===================================================================== замерщик
@@ -214,19 +274,17 @@ class Prober(fillcheck.Watcher):
             r = await self.trader.buy(sig["tok"], limit, shares)
         except Exception as e:  # noqa: BLE001
             r = {"ok": False, "status": "crash", "filled": 0.0, "avg_price": None,
-                 "error": f"{type(e).__name__}: {e}"[:200]}
+                 "spent": 0.0, "error": f"{type(e).__name__}: {e}"[:200], "note": ""}
         finally:
             self.inflight.discard(sig["tok"])
         send_ms = (time.perf_counter() - t0) * 1000
         self.sends.append(send_ms)
         filled = float(r.get("filled") or 0)
         avg = r.get("avg_price")
-        try:
-            avg = float(avg) if avg not in (None, "") else None
-        except (TypeError, ValueError):
-            avg = None
-        spent = filled * (avg if avg is not None else limit)
+        spent = float(r.get("spent") or 0.0)
         self.spent += spent
+        if r.get("note"):
+            self.info(f"ВНИМАНИЕ {r['note']}")
         r = {**r, "send_ms": send_ms, "filled": filled, "avg_price": avg, "spent": spent}
         self.results.append(r)
         self.count("order_ok" if r["ok"] else "order_fail")
@@ -298,7 +356,7 @@ async def approvals(cfg: dict, out: Path):
 
 # ======================================================================= check
 
-EXPECTED = ["post_order", "setup_trading_approvals"]
+EXPECTED = ["place_market_order", "post_order", "setup_trading_approvals"]
 # «взять что есть и уйти» — без этого заявка повиснет на рынке как GTC
 TAKE_HINTS = ("order_type", "fok", "fak", "immediate", "post_only", "expiration",
               "slippage", "max_price", "price")
